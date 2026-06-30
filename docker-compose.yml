@@ -1,0 +1,28 @@
+services:
+  gateway:
+    build: .
+    container_name: beacon-gateway
+    restart: unless-stopped
+    env_file:
+      - .env
+    # No host port published by default: a reverse proxy / tunnel on the same
+    # Docker network reaches the gateway by container name. Add a `ports:` mapping
+    # (e.g. "8080:8080") if you want to reach it directly on the host.
+    expose:
+      - "8080"
+    volumes:
+      - ./data:/app/data
+      - ./secrets:/app/secrets:ro
+    environment:
+      DB_PATH: /app/data/beacon.db
+    networks:
+      - frigate_default
+
+# Join Frigate's existing Docker network so the gateway can reach mosquitto:1883,
+# frigate:5000 (API), and frigate:1984 (go2rtc, direct — bypasses the nginx that
+# blocks the WebRTC POST), and so your reverse proxy / tunnel can route to it.
+# `frigate_default` is the default network name for the standard Frigate compose
+# stack — adjust to match yours (`docker network ls`).
+networks:
+  frigate_default:
+    external: true

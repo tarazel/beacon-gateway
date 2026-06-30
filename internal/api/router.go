@@ -1,0 +1,74 @@
+package api
+
+import (
+	"log/slog"
+	"net/http"
+	"time"
+
+	"github.com/hydak/beacon-gateway/internal/auth"
+)
+
+func NewRouter(h *Handlers, jwtIssuer *auth.JWTIssuer, store *auth.Store, log *slog.Logger) http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /healthz", h.Healthz)
+	mux.HandleFunc("POST /api/auth/apple", h.AppleSignIn)
+	mux.HandleFunc("POST /api/auth/refresh", h.Refresh)
+
+	protected := auth.Middleware(jwtIssuer)
+	// mediaProtected also accepts the long-lived media-scoped token the
+	// notification service extension uses (it can't refresh the access token).
+	mediaProtected := auth.MediaMiddleware(jwtIssuer)
+	adminOnly := auth.AdminOnly(store)
+	// admin wraps a handler so it runs behind Middleware (auth) then AdminOnly (role).
+	admin := func(next http.Handler) http.Handler { return protected(adminOnly(next)) }
+
+	mux.Handle("POST /api/devices", protected(http.HandlerFunc(h.RegisterDevice)))
+	mux.Handle("GET /api/mute", protected(http.HandlerFunc(h.GetMute)))
+	mux.Handle("POST /api/mute", protected(http.HandlerFunc(h.SetMute)))
+	mux.Handle("DELETE /api/mute", protected(http.HandlerFunc(h.SetMute)))
+	mux.Handle("GET /api/me", protected(http.HandlerFunc(h.GetMe)))
+	mux.Handle("GET /api/settings/clips", protected(http.HandlerFunc(h.GetClipSettings)))
+	mux.Handle("PUT /api/settings/clips", admin(http.HandlerFunc(h.PutClipSettings)))
+	mux.Handle("POST /api/invites", admin(http.HandlerFunc(h.CreateInvite)))
+	mux.Handle("GET /api/invites", admin(http.HandlerFunc(h.ListInvites)))
+	mux.Handle("DELETE /api/invites/{code}", admin(http.HandlerFunc(h.DeleteInvite)))
+	mux.Handle("GET /api/events", protected(http.HandlerFunc(h.ListEvents)))
+	mux.Handle("GET /api/events/{id}", protected(http.HandlerFunc(h.GetEvent)))
+	mux.Handle("GET /api/events/{id}/snapshot", mediaProtected(http.HandlerFunc(h.EventSnapshot)))
+	mux.Handle("GET /api/events/{id}/clip", mediaProtected(http.HandlerFunc(h.EventClip)))
+	mux.Handle("HEAD /api/events/{id}/clip", mediaProtected(http.HandlerFunc(h.EventClip)))
+	mux.Handle("PUT /api/events/{id}/keep", protected(http.HandlerFunc(h.SetEventKeep)))
+	mux.Handle("GET /api/cameras", protected(http.HandlerFunc(h.ListCameras)))
+	mux.Handle("GET /api/cameras/{id}/snapshot", protected(http.HandlerFunc(h.CameraSnapshot)))
+	mux.Handle("GET /api/cameras/{id}/live", protected(http.HandlerFunc(h.CameraLive)))
+	mux.Handle("POST /api/cameras/{id}/webrtc", protected(http.HandlerFunc(h.CameraWebRTC)))
+
+	return logging(log)(mux)
+}
+
+func logging(log *slog.Logger) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			start := time.Now()
+			rw := &statusWriter{ResponseWriter: w, status: 200}
+			next.ServeHTTP(rw, r)
+			log.Info("http",
+				"method", r.Method,
+				"path", r.URL.Path,
+				"status", rw.status,
+				"dur_ms", time.Since(start).Milliseconds(),
+			)
+		})
+	}
+}
+
+type statusWriter struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusWriter) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
+}

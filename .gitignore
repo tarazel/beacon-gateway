@@ -1,0 +1,26 @@
+# Binaries
+/bin/
+/gateway
+*.exe
+
+# Local config and secrets
+.env
+*.p8
+AuthKey_*.p8
+
+# Database
+*.db
+*.db-journal
+*.db-shm
+*.db-wal
+/data/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
+
+# SAM build artifacts
+deploy/relay/.aws-sam/
