@@ -81,6 +81,9 @@ DELETE /api/mute                       # clears the global mute
 GET    /api/settings/clips             # { retention_days }
 PUT    /api/settings/clips             # { retention_days } (clamped 1..3650) — ADMIN ONLY
 
+POST   /api/checkout                   # ADMIN: { plan? } → { url } — Stripe Checkout via relay (relay mode only)
+GET    /api/subscription               # { managed, plan, sub_status, active, expires_at } — household Beacon Pro status
+
 POST   /api/invites                    # ADMIN: { role?, cameras?[], note?, expires_in_seconds? } → invite + code
 GET    /api/invites                    # ADMIN: list invites
 DELETE /api/invites/{code}             # ADMIN: revoke an invite
