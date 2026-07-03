@@ -61,3 +61,12 @@ type CheckoutRequest struct {
 type CheckoutResponse struct {
 	URL string `json:"url"`
 }
+
+// SubscriptionResponse is returned from GET /v1/subscription — this instance's
+// current entitlement. Active is the computed verdict clients should gate on.
+type SubscriptionResponse struct {
+	Plan      string     `json:"plan"`
+	SubStatus string     `json:"sub_status"`
+	Active    bool       `json:"active"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
