@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/hydak/beacon-gateway/internal/apns"
 	"github.com/hydak/beacon-gateway/internal/settings"
@@ -51,4 +52,49 @@ func (h *Handlers) CreateCheckout(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+// subscriptionResponse is the app-facing shape for GET /api/subscription.
+// Managed is false when this gateway isn't in relay mode (the free/self-hosted
+// tier has no subscription), so the app can hide the subscription UI entirely.
+type subscriptionResponse struct {
+	Managed   bool       `json:"managed"`
+	Plan      string     `json:"plan,omitempty"`
+	SubStatus string     `json:"sub_status,omitempty"`
+	Active    bool       `json:"active"`
+	ExpiresAt *time.Time `json:"expires_at,omitempty"`
+}
+
+// GetSubscription reports this household's Beacon Pro status by querying the
+// relay with the gateway's instance token. Available to any authenticated user
+// (status is household-level, not sensitive); the upgrade action stays admin-only.
+func (h *Handlers) GetSubscription(w http.ResponseWriter, r *http.Request) {
+	if h.cfg.Relay.URL == "" {
+		writeJSON(w, http.StatusOK, subscriptionResponse{Managed: false})
+		return
+	}
+	instanceToken, err := h.settings.GetString(r.Context(), settings.KeyRelayInstanceToken, "")
+	if err != nil {
+		h.log.Error("subscription: read instance token", "err", err)
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if instanceToken == "" {
+		// Relay mode but not registered yet — managed, status not yet known.
+		writeJSON(w, http.StatusOK, subscriptionResponse{Managed: true, SubStatus: "unknown"})
+		return
+	}
+	sub, err := apns.SubscriptionFromRelay(r.Context(), h.cfg.Relay.URL, instanceToken, nil)
+	if err != nil {
+		h.log.Error("subscription: relay call failed", "err", err)
+		writeError(w, http.StatusBadGateway, "subscription status unavailable")
+		return
+	}
+	writeJSON(w, http.StatusOK, subscriptionResponse{
+		Managed:   true,
+		Plan:      sub.Plan,
+		SubStatus: sub.SubStatus,
+		Active:    sub.Active,
+		ExpiresAt: sub.ExpiresAt,
+	})
 }

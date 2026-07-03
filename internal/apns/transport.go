@@ -248,3 +248,31 @@ func CheckoutWithRelay(ctx context.Context, baseURL, instanceToken, plan string,
 	}
 	return &out, nil
 }
+
+// SubscriptionFromRelay fetches this instance's entitlement (plan/status/active)
+// from the relay, authenticated by the instance token.
+func SubscriptionFromRelay(ctx context.Context, baseURL, instanceToken string, client *http.Client) (*relay.SubscriptionResponse, error) {
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(baseURL, "/")+"/v1/subscription", nil)
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Authorization", "Bearer "+instanceToken)
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("relay subscription request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		return nil, fmt.Errorf("relay subscription returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out relay.SubscriptionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode relay subscription response: %w", err)
+	}
+	return &out, nil
+}
