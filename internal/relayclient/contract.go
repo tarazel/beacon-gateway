@@ -1,6 +1,6 @@
 // Package relayclient holds the wire-contract types the gateway needs to talk to
-// the central push relay (POST /v1/register and /v1/push). They are a hand-copied
-// subset of the relay's own types.
+// the central push relay (POST /v1/register, /v1/push, and /v1/checkout). They
+// are a hand-copied subset of the relay's own types.
 //
 // KEEP IN SYNC with the beacon-relay repo (internal/relay/relay.go). The gateway
 // only needs the request/response shapes and the per-device status strings, and
@@ -49,4 +49,15 @@ type RegisterResponse struct {
 	Plan          string     `json:"plan"`
 	SubStatus     string     `json:"sub_status"`
 	ExpiresAt     *time.Time `json:"expires_at,omitempty"`
+}
+
+// CheckoutRequest is the body of POST /v1/checkout.
+type CheckoutRequest struct {
+	Plan string `json:"plan"` // "monthly" (default) | "annual"
+}
+
+// CheckoutResponse is returned from POST /v1/checkout — the hosted Stripe
+// Checkout URL for the app to open in a browser.
+type CheckoutResponse struct {
+	URL string `json:"url"`
 }

@@ -30,6 +30,7 @@ func NewRouter(h *Handlers, jwtIssuer *auth.JWTIssuer, store *auth.Store, log *s
 	mux.Handle("GET /api/me", protected(http.HandlerFunc(h.GetMe)))
 	mux.Handle("GET /api/settings/clips", protected(http.HandlerFunc(h.GetClipSettings)))
 	mux.Handle("PUT /api/settings/clips", admin(http.HandlerFunc(h.PutClipSettings)))
+	mux.Handle("POST /api/checkout", admin(http.HandlerFunc(h.CreateCheckout)))
 	mux.Handle("POST /api/invites", admin(http.HandlerFunc(h.CreateInvite)))
 	mux.Handle("GET /api/invites", admin(http.HandlerFunc(h.ListInvites)))
 	mux.Handle("DELETE /api/invites/{code}", admin(http.HandlerFunc(h.DeleteInvite)))
