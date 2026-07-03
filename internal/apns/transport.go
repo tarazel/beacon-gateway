@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"strings"
@@ -210,6 +211,40 @@ func RegisterWithRelay(ctx context.Context, baseURL, registrationSecret string, 
 	var out relay.RegisterResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
 		return nil, fmt.Errorf("decode relay register response: %w", err)
+	}
+	return &out, nil
+}
+
+// CheckoutWithRelay asks the relay to create a Stripe Checkout Session for this
+// instance (authenticated by its instance token) and returns the hosted-checkout
+// URL for the app to open. Only meaningful in relay mode.
+func CheckoutWithRelay(ctx context.Context, baseURL, instanceToken, plan string, client *http.Client) (*relay.CheckoutResponse, error) {
+	if client == nil {
+		client = &http.Client{Timeout: 15 * time.Second}
+	}
+	buf, err := json.Marshal(relay.CheckoutRequest{Plan: plan})
+	if err != nil {
+		return nil, fmt.Errorf("marshal relay checkout: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/v1/checkout", bytes.NewReader(buf))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("Authorization", "Bearer "+instanceToken)
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("relay checkout request: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<16))
+		return nil, fmt.Errorf("relay checkout returned %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	var out relay.CheckoutResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode relay checkout response: %w", err)
 	}
 	return &out, nil
 }
