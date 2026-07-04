@@ -22,6 +22,7 @@ import (
 	"github.com/hydak/beacon-gateway/internal/frigate"
 	"github.com/hydak/beacon-gateway/internal/go2rtc"
 	"github.com/hydak/beacon-gateway/internal/mqtt"
+	"github.com/hydak/beacon-gateway/internal/notifrules"
 	"github.com/hydak/beacon-gateway/internal/settings"
 )
 
@@ -55,6 +56,7 @@ func run() error {
 	appleVerifier := auth.NewAppleVerifier(cfg.Auth.AppleClientID)
 	eventStore := events.NewStore(database)
 	settingsStore := settings.NewStore(database)
+	rulesStore := notifrules.NewStore(database)
 	frigateClient := frigate.NewClient(cfg.Frigate)
 	cameraRegistry := cameras.NewRegistry(cfg.Cameras)
 	go2rtcClient := go2rtc.NewClient(cfg.Go2RTC.BaseURL)
@@ -63,9 +65,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	apnsSender := apns.NewSender(pushTransport, database, cfg.APNs.UseSandbox, log)
+	apnsSender := apns.NewSender(pushTransport, database, ruleAdapter{rulesStore}, cfg.APNs.UseSandbox, log)
 
-	handlers := api.NewHandlers(cfg, log, database, userStore, jwtIssuer, appleVerifier, eventStore, frigateClient, cameraRegistry, go2rtcClient, settingsStore)
+	handlers := api.NewHandlers(cfg, log, database, userStore, jwtIssuer, appleVerifier, eventStore, frigateClient, cameraRegistry, go2rtcClient, settingsStore, rulesStore)
 	router := api.NewRouter(handlers, jwtIssuer, userStore, log)
 
 	clipPruner := clips.NewPruner(cfg.ClipsDir(), log,
@@ -96,7 +98,7 @@ func run() error {
 		}
 	}()
 
-	mqttSub := mqtt.New(cfg.MQTT, log, eventDispatcher(log, eventStore, apnsSender, cfg))
+	mqttSub := mqtt.New(cfg.MQTT, log, eventDispatcher(log, eventStore, apnsSender, frigateClient, cfg))
 	go func() {
 		if err := mqttSub.Start(rootCtx); err != nil {
 			log.Warn("mqtt failed to start; will keep retrying in background", "err", err)
@@ -166,7 +168,34 @@ func ensureRelayRegistration(ctx context.Context, cfg *config.Config, settingsSt
 	return resp.InstanceToken, nil
 }
 
-func eventDispatcher(log *slog.Logger, store *events.Store, sender *apns.Sender, cfg *config.Config) mqtt.MessageHandler {
+// prewarmClip caches (downloads + remuxes) an event's clip ahead of any user
+// request. Runs in its own goroutine with a fresh, bounded context — the MQTT
+// message context is short-lived, but a remux can take a while. Best-effort:
+// failures are logged, not surfaced (the clip still remuxes on demand later).
+func prewarmClip(log *slog.Logger, frig *frigate.Client, cfg *config.Config, id string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	defer cancel()
+	if _, err := frig.EnsureCachedClip(ctx, id, cfg.ClipsDir()); err != nil {
+		log.Warn("clip prewarm failed", "event_id", id, "err", err)
+		return
+	}
+	log.Info("clip prewarmed", "event_id", id)
+}
+
+// ruleAdapter bridges the notifrules.Store to the apns.Ruler interface, keeping
+// the apns package unaware of the concrete rules implementation (and vice versa).
+type ruleAdapter struct{ store *notifrules.Store }
+
+func (a ruleAdapter) Allows(ctx context.Context, userID string, ev apns.RuleEvent) bool {
+	return a.store.Allows(ctx, userID, notifrules.Event{
+		Camera: ev.Camera,
+		Label:  ev.Label,
+		Zones:  ev.Zones,
+		Score:  ev.Score,
+	})
+}
+
+func eventDispatcher(log *slog.Logger, store *events.Store, sender *apns.Sender, frig *frigate.Client, cfg *config.Config) mqtt.MessageHandler {
 	return func(ctx context.Context, topic string, payload []byte) {
 		ev, err := frigate.ParseEvent(payload)
 		if err != nil {
@@ -180,13 +209,20 @@ func eventDispatcher(log *slog.Logger, store *events.Store, sender *apns.Sender,
 			return
 		}
 
+		// On the end phase the clip is available in Frigate. Pre-warm the cache in
+		// the background so the notification-tap → clip path skips the synchronous
+		// download+remux (which can exceed Cloudflare's timeout for long clips).
+		if ev.Type == frigate.PhaseEnd && ev.After.HasClip && frig != nil {
+			go prewarmClip(log, frig, cfg, ev.After.ID)
+		}
+
 		if !created {
 			return
 		}
 
 		state := ev.After
-		title := titleFor(state.Camera)
-		body := bodyFor(state.Label, state.SubLabel)
+		title := events.PushTitle(state.Camera)
+		body := events.PushBody(state.Label, state.SubLabel)
 		snapshotURL := ""
 		if state.HasSnapshot {
 			snapshotURL = cfg.PublicSnapshotURL(state.ID)
@@ -200,27 +236,14 @@ func eventDispatcher(log *slog.Logger, store *events.Store, sender *apns.Sender,
 			Camera:      state.Camera,
 			Label:       state.Label,
 			SnapshotURL: snapshotURL,
-		}); err != nil {
+			Zones:       state.Zones,
+			Score:       state.TopScore,
+		}); err != nil && !errors.Is(err, apns.ErrSubscriptionInactive) {
+			// Subscription-inactive is already logged loudly inside SendToAll; don't
+			// double-warn. Everything else is an unexpected delivery failure.
 			log.Warn("push send failed", "event_id", state.ID, "err", err)
 		}
 	}
-}
-
-func titleFor(camera string) string {
-	if camera == "" {
-		return "Activity detected"
-	}
-	return camera
-}
-
-func bodyFor(label string, sub *string) string {
-	if sub != nil && *sub != "" {
-		return *sub + " detected"
-	}
-	if label == "" {
-		return "Motion detected"
-	}
-	return label + " detected"
 }
 
 func newLogger(level string) *slog.Logger {

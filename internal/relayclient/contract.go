@@ -30,7 +30,8 @@ type PushResult struct {
 
 // PushRequest is the body of POST /v1/push.
 type PushRequest struct {
-	Environment  string          `json:"environment"` // "production" | "sandbox"
+	Environment  string          `json:"environment"`        // "production" | "sandbox"
+	Platform     string          `json:"platform,omitempty"` // "ios" | "android"; empty = "ios"
 	DeviceTokens []string        `json:"device_tokens"`
 	Payload      json.RawMessage `json:"payload"`
 }

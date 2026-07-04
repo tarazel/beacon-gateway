@@ -27,6 +27,29 @@ type Event struct {
 	UpdatedAt   time.Time  `json:"updated_at"`
 }
 
+// PushTitle returns the notification title for an event's camera. Kept here (not
+// in cmd/gateway) so the MQTT dispatcher and the media-scoped push-metadata
+// endpoint — which the NSE reads when it gets a privacy-minimal relay push —
+// format notifications identically.
+func PushTitle(camera string) string {
+	if camera == "" {
+		return "Activity detected"
+	}
+	return camera
+}
+
+// PushBody returns the notification body from an event's label / sub-label,
+// preferring the sub-label (e.g. a recognized name) when present.
+func PushBody(label string, sub *string) string {
+	if sub != nil && *sub != "" {
+		return *sub + " detected"
+	}
+	if label == "" {
+		return "Motion detected"
+	}
+	return label + " detected"
+}
+
 type Store struct {
 	db *sql.DB
 }

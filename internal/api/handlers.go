@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -21,6 +22,7 @@ import (
 	"github.com/hydak/beacon-gateway/internal/events"
 	"github.com/hydak/beacon-gateway/internal/frigate"
 	"github.com/hydak/beacon-gateway/internal/go2rtc"
+	"github.com/hydak/beacon-gateway/internal/notifrules"
 	"github.com/hydak/beacon-gateway/internal/settings"
 )
 
@@ -36,6 +38,7 @@ type Handlers struct {
 	cameras     *cameras.Registry
 	go2rtc      *go2rtc.Client
 	settings    *settings.Store
+	notifrules  *notifrules.Store
 	allowlist   map[string]struct{}
 	adminEmails map[string]struct{}
 }
@@ -52,6 +55,7 @@ func NewHandlers(
 	camRegistry *cameras.Registry,
 	go2rtcClient *go2rtc.Client,
 	settingsStore *settings.Store,
+	rulesStore *notifrules.Store,
 ) *Handlers {
 	allow := make(map[string]struct{}, len(cfg.Auth.AppleAllowedEmails))
 	for _, e := range cfg.Auth.AppleAllowedEmails {
@@ -73,6 +77,7 @@ func NewHandlers(
 		cameras:     camRegistry,
 		go2rtc:      go2rtcClient,
 		settings:    settingsStore,
+		notifrules:  rulesStore,
 		allowlist:   allow,
 		adminEmails: admins,
 	}
@@ -293,6 +298,9 @@ func (h *Handlers) GetMe(w http.ResponseWriter, r *http.Request) {
 type registerDeviceRequest struct {
 	APNsToken  string `json:"apns_token"`
 	AppVersion string `json:"app_version,omitempty"`
+	// Platform routes the push backend: "ios" (APNs, default) or "android" (FCM).
+	// Empty defaults to "ios" for older iOS clients that don't send it.
+	Platform string `json:"platform,omitempty"`
 }
 
 func (h *Handlers) RegisterDevice(w http.ResponseWriter, r *http.Request) {
@@ -307,16 +315,21 @@ func (h *Handlers) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	platform := req.Platform
+	if platform == "" {
+		platform = "ios"
+	}
 	now := time.Now().Unix()
 	id := uuid.NewString()
 	_, err := h.db.ExecContext(r.Context(), `
-		INSERT INTO devices (id, user_id, apns_token, app_version, last_seen_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?)
+		INSERT INTO devices (id, user_id, apns_token, platform, app_version, last_seen_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(apns_token) DO UPDATE SET
 			user_id = excluded.user_id,
+			platform = excluded.platform,
 			app_version = excluded.app_version,
 			last_seen_at = excluded.last_seen_at
-	`, id, userID, req.APNsToken, nullableStr(req.AppVersion), now, now)
+	`, id, userID, req.APNsToken, platform, nullableStr(req.AppVersion), now, now)
 	if err != nil {
 		h.log.Error("device register failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "register failed")
@@ -567,6 +580,45 @@ func (h *Handlers) GetEvent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, ev)
 }
 
+// eventPushMetaResp is the just-enough-to-render-a-banner view of an event the
+// notification service extension fetches when it receives a privacy-minimal
+// relay push (which carries only event_id). The formatting mirrors the MQTT
+// dispatcher exactly (events.PushTitle/PushBody) so a relay-mode banner reads
+// identically to a direct-mode one.
+type eventPushMetaResp struct {
+	Title       string `json:"title"`
+	Body        string `json:"body"`
+	ThreadID    string `json:"thread_id"`
+	HasSnapshot bool   `json:"has_snapshot"`
+}
+
+// EventPushMeta serves the notification title/body/thread for one event. It sits
+// behind MediaMiddleware (accepts the long-lived media token the NSE holds) and
+// enforces the caller's per-camera scope via eventForUser, so it exposes nothing
+// the caller couldn't already read from the snapshot endpoint.
+func (h *Handlers) EventPushMeta(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "auth required")
+		return
+	}
+	id := r.PathValue("id")
+	if id == "" {
+		writeError(w, http.StatusBadRequest, "event id required")
+		return
+	}
+	ev, ok := h.eventForUser(w, r, userID, id)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, eventPushMetaResp{
+		Title:       events.PushTitle(ev.Camera),
+		Body:        events.PushBody(ev.Label, ev.SubLabel),
+		ThreadID:    ev.Camera,
+		HasSnapshot: ev.HasSnapshot,
+	})
+}
+
 // cameraAccessible reports whether the user may view a specific camera, per their
 // role + per-camera scope (admins and unscoped members see all).
 func (h *Handlers) cameraAccessible(ctx context.Context, userID, camera string) (bool, error) {
@@ -662,7 +714,15 @@ type cameraLiveResp struct {
 	DisplayName string `json:"display_name"`
 	Protocol    string `json:"protocol"`
 	WebRTCURL   string `json:"webrtc_url"`
+	// HLSURL is the tunnel-friendly fallback (WebRTC needs UDP, which the HTTP
+	// tunnel doesn't carry, so it's LAN-only). It embeds a short-lived HLS token
+	// so the client can play it directly. Empty if the token couldn't be minted.
+	HLSURL string `json:"hls_url,omitempty"`
 }
+
+// hlsTokenTTL bounds a live-view session's HLS token. Long enough for a viewing
+// session, short enough to limit blast radius if the tokenized URL leaks (logs).
+const hlsTokenTTL = time.Hour
 
 func (h *Handlers) CameraLive(w http.ResponseWriter, r *http.Request) {
 	userID, ok := auth.UserID(r.Context())
@@ -680,12 +740,20 @@ func (h *Handlers) CameraLive(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	base := strings.TrimRight(h.cfg.PublicBaseURL, "/")
-	writeJSON(w, http.StatusOK, cameraLiveResp{
+	resp := cameraLiveResp{
 		ID:          cam.ID,
 		DisplayName: cam.DisplayName,
 		Protocol:    "webrtc-whep",
 		WebRTCURL:   base + "/api/cameras/" + cam.ID + "/webrtc",
-	})
+	}
+	if h.jwt != nil {
+		if tok, _, err := h.jwt.IssueHLS(userID, hlsTokenTTL); err == nil {
+			resp.HLSURL = base + "/api/cameras/" + cam.ID + "/hls/index.m3u8?token=" + url.QueryEscape(tok)
+		} else {
+			h.log.Warn("hls token mint failed", "camera", id, "err", err)
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (h *Handlers) CameraWebRTC(w http.ResponseWriter, r *http.Request) {

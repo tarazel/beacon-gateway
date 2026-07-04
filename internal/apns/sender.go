@@ -18,6 +18,27 @@ type Notification struct {
 	Camera      string
 	Label       string
 	SnapshotURL string
+	// Zones + Score are not sent in the payload; they feed per-user rule
+	// evaluation (see Ruler) so a member can filter by zone or minimum score.
+	Zones []string
+	Score float64
+}
+
+// Ruler decides, per user, whether an event should notify them — the per-user
+// notification rules (label / zone / min-score / quiet-hours / cooldown) applied
+// AFTER camera scope + mute and BEFORE delivery. A nil Ruler on the Sender means
+// no rule filtering (every eligible device is notified). Allows may have a side
+// effect (recording cooldown), so the Sender calls it exactly once per user.
+type Ruler interface {
+	Allows(ctx context.Context, userID string, ev RuleEvent) bool
+}
+
+// RuleEvent is the event data a Ruler evaluates against.
+type RuleEvent struct {
+	Camera string
+	Label  string
+	Zones  []string
+	Score  float64
 }
 
 // Sender selects which devices should receive a push (mute + per-camera scope),
@@ -28,15 +49,18 @@ type Sender struct {
 	db        *sql.DB
 	log       *slog.Logger
 	sandbox   bool
+	ruler     Ruler
 }
 
 // NewSender wires a Sender to a delivery Transport (DirectTransport or
-// RelayTransport). transport may be nil, in which case pushes are skipped.
-func NewSender(transport Transport, db *sql.DB, sandbox bool, log *slog.Logger) *Sender {
+// RelayTransport) and an optional per-user Ruler. transport may be nil, in which
+// case pushes are skipped; ruler may be nil, in which case no rule filtering is
+// applied (every eligible device is notified).
+func NewSender(transport Transport, db *sql.DB, ruler Ruler, sandbox bool, log *slog.Logger) *Sender {
 	if transport == nil {
 		log.Warn("apns: no transport configured, pushes will be skipped")
 	}
-	return &Sender{transport: transport, db: db, log: log, sandbox: sandbox}
+	return &Sender{transport: transport, db: db, ruler: ruler, log: log, sandbox: sandbox}
 }
 
 func (s *Sender) SendToAll(ctx context.Context, n Notification) error {
@@ -51,7 +75,7 @@ func (s *Sender) SendToAll(ctx context.Context, n Notification) error {
 	// a scoped member must have a row for this camera.
 	now := time.Now().Unix()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT d.id, d.apns_token
+		SELECT u.id, d.id, d.apns_token, d.platform
 		FROM devices d
 		JOIN users u ON u.id = d.user_id
 		WHERE (u.muted_until IS NULL OR u.muted_until <= ?)
@@ -70,38 +94,99 @@ func (s *Sender) SendToAll(ctx context.Context, n Notification) error {
 	}
 	defer rows.Close()
 
+	// Group tokens by user so per-user notification rules can be applied once per
+	// user (scope + mute are already enforced by the query above).
+	// Group tokens by user so per-user notification rules can be applied once per
+	// user (scope + mute are already enforced by the query above). Track each
+	// token's platform so we can route it to the right push backend (APNs/FCM).
 	tokenToID := make(map[string]string)
-	var deviceTokens []string
+	tokenPlatform := make(map[string]string)
+	userTokens := make(map[string][]string)
+	var userOrder []string
 	for rows.Next() {
-		var id, tok string
-		if err := rows.Scan(&id, &tok); err != nil {
+		var userID, id, tok, platform string
+		if err := rows.Scan(&userID, &id, &tok, &platform); err != nil {
 			return err
 		}
+		if platform == "" {
+			platform = "ios"
+		}
 		tokenToID[tok] = id
-		deviceTokens = append(deviceTokens, tok)
+		tokenPlatform[tok] = platform
+		if _, seen := userTokens[userID]; !seen {
+			userOrder = append(userOrder, userID)
+		}
+		userTokens[userID] = append(userTokens[userID], tok)
 	}
 	if err := rows.Err(); err != nil {
 		return err
 	}
 
-	if len(deviceTokens) == 0 {
+	if len(userTokens) == 0 {
 		s.log.Info("apns: no registered devices", "event_id", n.EventID)
 		return nil
 	}
 
-	payloadBytes, err := buildPayload(n)
-	if err != nil {
-		return fmt.Errorf("build payload: %w", err)
+	// Apply each user's notification rules (label/zone/score/quiet-hours/cooldown),
+	// then bucket the surviving tokens by platform. A user filtered out here never
+	// reaches the relay/APNs.
+	ruleEv := RuleEvent{Camera: n.Camera, Label: n.Label, Zones: n.Zones, Score: n.Score}
+	byPlatform := make(map[string][]string)
+	var totalTokens, filteredUsers int
+	for _, userID := range userOrder {
+		if s.ruler != nil && !s.ruler.Allows(ctx, userID, ruleEv) {
+			filteredUsers++
+			continue
+		}
+		for _, tok := range userTokens[userID] {
+			p := tokenPlatform[tok]
+			byPlatform[p] = append(byPlatform[p], tok)
+			totalTokens++
+		}
 	}
 
+	if totalTokens == 0 {
+		s.log.Info("apns: all recipients filtered by notification rules", "event_id", n.EventID, "camera", n.Camera, "users_filtered", filteredUsers)
+		return nil
+	}
+	if filteredUsers > 0 {
+		s.log.Info("apns: some recipients filtered by notification rules", "event_id", n.EventID, "users_filtered", filteredUsers)
+	}
+
+	// The transport renders the payload: DirectTransport builds the rich payload,
+	// RelayTransport the privacy-minimal one (event_id only). See Transport.BuildPayload.
+	// NOTE: this is the APNs payload shape. FCM (Android) needs its own payload —
+	// that translation lands with the FCM pusher in P2.9(b); today all devices are iOS.
 	env := "production"
 	if s.sandbox {
 		env = "sandbox"
 	}
 
-	results, err := s.transport.Deliver(ctx, env, deviceTokens, payloadBytes)
-	if err != nil {
-		return fmt.Errorf("deliver via %s: %w", s.transport.Name(), err)
+	// Deliver per platform so each bucket routes to the right backend (iOS→APNs,
+	// Android→FCM via the relay). Payloads are platform-specific (APNs JSON vs FCM
+	// data), so build per bucket.
+	var results []Result
+	for platform, toks := range byPlatform {
+		payloadBytes, berr := s.transport.BuildPayload(platform, n)
+		if berr != nil {
+			return fmt.Errorf("build payload (platform %s): %w", platform, berr)
+		}
+		res, derr := s.transport.Deliver(ctx, platform, env, toks, payloadBytes)
+		if derr != nil {
+			// A lapsed subscription drops the whole household's pushes. Never let that
+			// be silent — log it loudly and distinctly (the app surfaces the same state
+			// via GET /api/subscription). The caller still gets the sentinel.
+			if errors.Is(derr, ErrSubscriptionInactive) {
+				s.log.Warn("PUSH DROPPED: Beacon Pro subscription inactive — the relay is refusing pushes for this household; renew to restore notifications",
+					"reason", "subscription_inactive",
+					"devices_dropped", totalTokens,
+					"camera", n.Camera,
+					"event_id", n.EventID)
+				return derr
+			}
+			return fmt.Errorf("deliver via %s (platform %s): %w", s.transport.Name(), platform, derr)
+		}
+		results = append(results, res...)
 	}
 
 	var errs []string

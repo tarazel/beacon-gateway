@@ -32,8 +32,15 @@ Camera ──RTSP──> Frigate ──MQTT──> Gateway (Go) ──APNs──
   Sign in with Apple + JWT, translates MQTT events into APNs push, proxies
   Frigate snapshots/clips, and brokers WebRTC SDP with go2rtc.
 - The **app** never touches Frigate directly.
-- **Live view is peer-to-peer** between the device and go2rtc once SDP is
+- **Live view is peer-to-peer** (WebRTC) between the device and go2rtc once SDP is
   exchanged; the gateway is only in the signaling path — it doesn't relay video.
+  WebRTC needs UDP, so it only works on-LAN through an HTTP tunnel. **Off-network
+  the app falls back to HLS**, which the gateway *does* proxy (`/api/cameras/{id}/
+  hls/*`): it fetches go2rtc's HLS (H.264 substream — the hard rule holds), rewrites
+  every playlist URI to route segments back through the authed gateway, and streams
+  them. Segment URLs are SameOrigin-checked before fetch (they arrive in a client
+  param — else SSRF). The app tries WebRTC first and auto-falls-back to HLS on
+  failure (plus a manual toggle).
 
 ---
 
@@ -73,13 +80,18 @@ GET    /healthz
 POST   /api/auth/apple                 # Sign in with Apple — token → JWT + refresh
 POST   /api/auth/refresh               # refresh token → new JWT + refresh
 
-POST   /api/devices                    # register APNs device token
+POST   /api/devices                    # register push device token { apns_token, platform?, app_version? } — platform "ios"(default)|"android"
 GET    /api/me                         # { user_id, email, name, role, is_admin, all_cameras, cameras[] }
 GET    /api/mute                       # { muted_until, cameras:[{camera,muted_until}] }
 POST   /api/mute                       # { duration_seconds, camera? } — camera omitted = global; 0 clears
 DELETE /api/mute                       # clears the global mute
 GET    /api/settings/clips             # { retention_days }
 PUT    /api/settings/clips             # { retention_days } (clamped 1..3650) — ADMIN ONLY
+GET    /api/notification-rules         # caller's own rules { labels[], zones[], min_score, cooldown_seconds, quiet_start_min, quiet_end_min }
+PUT    /api/notification-rules         # replace caller's rules (server normalizes/clamps; echoes result)
+GET    /api/cameras/{id}/live          # descriptor { protocol, webrtc_url, hls_url } — hls_url embeds a short-lived HLS token
+GET    /api/cameras/{id}/hls/index.m3u8  # HLS playlist proxy (H.264 substream via go2rtc); token via ?token= or Bearer
+GET    /api/cameras/{id}/hls/r         # HLS segment/sub-playlist proxy (?u=<b64 go2rtc URL>&token=)
 
 POST   /api/checkout                   # ADMIN: { plan? } → { url } — Stripe Checkout via relay (relay mode only)
 GET    /api/subscription               # { managed, plan, sub_status, active, expires_at } — household Beacon Pro status
@@ -89,6 +101,7 @@ GET    /api/invites                    # ADMIN: list invites
 DELETE /api/invites/{code}             # ADMIN: revoke an invite
 GET    /api/events                     # ?camera=&label=&since=&limit= (scoped to caller's cameras)
 GET    /api/events/{id}
+GET    /api/events/{id}/push           # { title, body, thread_id, has_snapshot } — MEDIA-scoped; NSE reads this to render a minimal relay push
 GET    /api/events/{id}/snapshot       # proxied JPEG with Range support
 GET    /api/events/{id}/clip           # proxied MP4 with Range support
 HEAD   /api/events/{id}/clip           # AVPlayer probes this before downloading
@@ -163,17 +176,47 @@ enforced via a conditional UPDATE). Codes use an unambiguous alphabet, `XXXX-XXX
    and the event state.
 2. Gateway upserts every phase into the `events` table.
 3. On the `new` phase only, the gateway selects devices (honoring mute + per-camera
-   scope — all PII/selection logic lives here), builds a payload, and delivers it
-   via the configured `apns.Transport`:
+   scope — all PII/selection logic lives here), then applies **per-user notification
+   rules** (`internal/notifrules`) via the `apns.Ruler` seam: for each eligible
+   user, their stored rule (label allowlist / zone / min-score / quiet-hours /
+   per-camera cooldown) decides whether to notify them. Users filtered out here
+   never reach the relay/APNs (saves push volume + honors each member's prefs).
+   Rules default to allow-all, evaluate in the gateway's local time, and fail open
+   on a storage error. Surviving tokens are then **bucketed by device platform**
+   (`ios`/`android`) and delivered per-platform, so each routes to the right push
+   backend (`Transport.Deliver` takes the platform; the relay routes ios→APNs,
+   android→FCM). Delivery goes via the configured `apns.Transport`, which also
+   **renders its own payload**
+   (`Transport.BuildPayload`), because the two paths have different privacy needs:
    - `DirectTransport` — signs with the gateway's own `.p8` and POSTs to APNs.
+     Builds the **rich payload** (title/body/camera/label/snapshot_url); no third
+     party sees it, so the NSE just attaches the snapshot image.
    - `RelayTransport` — forwards `{device_tokens, payload}` to the relay's
-     `/v1/push`; the relay holds the `.p8` and signs. First-boot registration is
-     keyed off `RELAY_URL` + `RELAY_REGISTRATION_SECRET`; the instance token is
-     persisted in the `settings` table (`relay_instance_token`).
+     `/v1/push`; the relay holds the `.p8` and signs. Builds a **privacy-minimal
+     payload** — `mutable-content` + `event_id` + a generic placeholder alert, and
+     nothing else. The relay therefore never sees camera/label/snapshot; the
+     on-device NSE fetches those from the user's own gateway via
+     `GET /api/events/{id}/push` (+ `/snapshot`), authed with its media token.
+     First-boot registration is keyed off `RELAY_URL` + `RELAY_REGISTRATION_SECRET`;
+     the instance token is persisted in `settings` (`relay_instance_token`).
 
-The relay never sees user data — only a device token + an opaque payload. The
-contract types live in `internal/relayclient` and **must be kept in sync** with
-the relay repo's `internal/relay` definitions.
+On the `end` phase (clip now available), the dispatcher **pre-warms the clip
+cache** in the background (`prewarmClip` → `frigate.EnsureCachedClip`) so a later
+notification-tap skips the synchronous download+remux. Concurrent cachers of the
+same event id are serialized by a per-id lock in `frigate.Client` (a pre-warm
+racing a user tap can't run ffmpeg twice on the same temp files).
+
+The relay never sees user data — only a device token + an opaque, content-free
+payload. The contract types live in `internal/relayclient` and **must be kept in
+sync** with the relay repo's `internal/relay` definitions.
+
+**Lapsed subscription is loud, not silent.** When the relay rejects a push with
+HTTP 402 (the instance's Beacon Pro subscription lapsed / trial expired),
+`RelayTransport.Deliver` returns the `apns.ErrSubscriptionInactive` sentinel and
+`Sender.SendToAll` logs a prominent `PUSH DROPPED …` WARN (with the dropped-device
+count) instead of an opaque delivery error. The app surfaces the same state via
+`GET /api/subscription` (`active:false`) as an app-wide banner, so a family whose
+push has stopped is never left guessing.
 
 ---
 
@@ -182,8 +225,9 @@ the relay repo's `internal/relay` definitions.
 SQLite with WAL mode, single file (`data/beacon.db`). Tables: `users` (incl.
 global `muted_until` + `role`), `devices`, `events` (incl. `keep_clip`),
 `refresh_tokens`, `allowed_emails`, `camera_mutes`, `user_cameras`, `invites`,
-`settings` (key/value), plus `schema_migrations` tracking applied migrations from
-`internal/db/migrations/*.sql`.
+`settings` (key/value), `notification_rules` + `notification_cooldowns` (per-user
+push rules + cooldown state), plus `schema_migrations` tracking applied migrations
+from `internal/db/migrations/*.sql`.
 
 ---
 

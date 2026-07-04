@@ -16,6 +16,13 @@ const issuer = "beacon-gateway"
 // (empty), so it is omitted from the JSON.
 const ScopeMedia = "media"
 
+// ScopeHLS marks a short-lived token usable ONLY on the HLS live-view endpoints.
+// It's issued by the live descriptor and embedded in the returned HLS URL as a
+// query param, so AVPlayer (which can't set Authorization headers on HLS segment
+// requests) can play the stream directly. It carries the user's sub, so per-camera
+// access is still enforced; a short TTL bounds the URL-leak blast radius.
+const ScopeHLS = "hls"
+
 type Claims struct {
 	UserID string `json:"sub"`
 	Scope  string `json:"scope,omitempty"`
@@ -41,6 +48,12 @@ func (i *JWTIssuer) Issue(userID string) (string, time.Time, error) {
 // access is enforced normally; a leak only exposes that user's media.
 func (i *JWTIssuer) IssueMedia(userID string, ttl time.Duration) (string, time.Time, error) {
 	return i.issue(userID, ScopeMedia, ttl)
+}
+
+// IssueHLS mints a short-lived, HLS-scoped token for one live-view session,
+// embedded in the HLS URL so AVPlayer can play it directly (see ScopeHLS).
+func (i *JWTIssuer) IssueHLS(userID string, ttl time.Duration) (string, time.Time, error) {
+	return i.issue(userID, ScopeHLS, ttl)
 }
 
 func (i *JWTIssuer) issue(userID, scope string, ttl time.Duration) (string, time.Time, error) {

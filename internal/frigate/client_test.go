@@ -1,11 +1,15 @@
 package frigate
 
 import (
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/hydak/beacon-gateway/internal/config"
 )
@@ -110,4 +114,66 @@ func TestProxyHeadMethodOmitsBody(t *testing.T) {
 	if gotMethod != http.MethodHead {
 		t.Errorf("upstream method should be HEAD, got %q", gotMethod)
 	}
+}
+
+// TestEnsureCachedClip_FastPathSkipsFetch verifies an already-cached clip is
+// returned without touching Frigate (the pre-warm / serve fast path). The client
+// points at a server that fails any request, so a fetch here would error.
+func TestEnsureCachedClip_FastPathSkipsFetch(t *testing.T) {
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		t.Errorf("unexpected fetch for an already-cached clip: %s", r.URL.Path)
+		http.Error(w, "boom", http.StatusInternalServerError)
+	}))
+	defer failing.Close()
+
+	c := NewClient(config.Frigate{BaseURL: failing.URL})
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "evt1.mp4"), []byte("cached-bytes"), 0o644); err != nil {
+		t.Fatalf("seed cache: %v", err)
+	}
+
+	path, err := c.EnsureCachedClip(context.Background(), "evt1", dir)
+	if err != nil {
+		t.Fatalf("EnsureCachedClip: %v", err)
+	}
+	if path != filepath.Join(dir, "evt1.mp4") {
+		t.Fatalf("unexpected path: %s", path)
+	}
+}
+
+// TestLockClip_SerializesSameID confirms the per-id lock is mutually exclusive
+// for one id but independent across ids — the guarantee that keeps a pre-warm
+// from racing a user tap on the same clip.
+func TestLockClip_SerializesSameID(t *testing.T) {
+	c := NewClient(config.Frigate{})
+
+	unlock := c.lockClip("a")
+	acquired := make(chan struct{})
+	go func() {
+		u2 := c.lockClip("a") // must block until unlock() below
+		close(acquired)
+		u2()
+	}()
+	select {
+	case <-acquired:
+		t.Fatal("second lock on same id acquired while first was held")
+	case <-time.After(50 * time.Millisecond):
+	}
+	unlock()
+	select {
+	case <-acquired:
+	case <-time.After(time.Second):
+		t.Fatal("second lock never acquired after release")
+	}
+
+	// A different id is not blocked by a held lock.
+	held := c.lockClip("b")
+	done := make(chan struct{})
+	go func() { u := c.lockClip("c"); u(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("lock on a different id should not block")
+	}
+	held()
 }
