@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -18,6 +19,12 @@ import (
 	"github.com/hydak/beacon-gateway/internal/config"
 	relay "github.com/hydak/beacon-gateway/internal/relayclient"
 )
+
+// ErrSubscriptionInactive is returned by RelayTransport.Deliver when the relay
+// rejects a push with HTTP 402 because this instance's Beacon Pro subscription
+// has lapsed (or its trial expired). Sender treats it specially and logs loudly,
+// so a household's dropped pushes are never buried in a generic delivery error.
+var ErrSubscriptionInactive = errors.New("relay: Beacon Pro subscription inactive")
 
 // Delivery status values, aligned with the relay's so results map 1:1 across
 // both transports.
@@ -35,19 +42,37 @@ type Result struct {
 	Reason      string
 }
 
-// Transport delivers an already-built APNs payload to a set of device tokens.
-// The device-selection + payload-building logic lives in Sender; a Transport
-// only does the wire delivery — either directly to APNs (DirectTransport, for
-// self-hosters with their own .p8) or via the central relay (RelayTransport).
+// Transport delivers an APNs payload to a set of device tokens. The
+// device-selection logic lives in Sender, which asks the Transport to render the
+// payload (BuildPayload) and then to deliver it (Deliver) — either directly to
+// APNs (DirectTransport, for self-hosters with their own .p8) or via the central
+// relay (RelayTransport). Rendering is a Transport concern because the relay path
+// must be privacy-minimal while the direct path can be rich (see BuildPayload).
 type Transport interface {
-	Deliver(ctx context.Context, environment string, deviceTokens []string, payload []byte) ([]Result, error)
+	// BuildPayload renders a Notification into the APNs payload JSON this
+	// transport should send. The two transports intentionally differ:
+	//   - DirectTransport signs with the self-hoster's own .p8, so no third party
+	//     ever sees the payload — it sends the full rich payload
+	//     (title/body/camera/label/snapshot_url) and the NSE just attaches the image.
+	//   - RelayTransport forwards through Tarazel's hosted relay, so the payload
+	//     must NOT carry event content. It sends a privacy-minimal payload
+	//     (mutable-content + event_id + a generic placeholder alert); the on-device
+	//     NSE fetches title/body/snapshot from the user's OWN gateway. This is what
+	//     makes the advertised "relay never sees camera/label/image" property true.
+	// BuildPayload renders the payload for the given platform: an APNs payload for
+	// "ios", an FCM `data` map for "android". (Payloads are platform-specific, so
+	// SendToAll calls this per platform bucket.)
+	BuildPayload(platform string, n Notification) ([]byte, error)
+	// Deliver sends payload to deviceTokens for the given platform ("ios"/"android").
+	// The relay routes by platform (APNs vs FCM); DirectTransport is iOS-only.
+	Deliver(ctx context.Context, platform, environment string, deviceTokens []string, payload []byte) ([]Result, error)
 	Name() string
 }
 
-// buildPayload renders a Notification into APNs payload JSON. This is the same
-// rich payload the gateway has always sent (title/body/snapshot URL); the
-// privacy-minimal relay payload is a future change paired with an iOS NSE update.
-func buildPayload(n Notification) ([]byte, error) {
+// buildRichPayload renders the full payload the gateway sends when it signs
+// pushes itself (DirectTransport): title/body/snapshot URL are carried in the
+// push so the NSE only has to attach the snapshot image.
+func buildRichPayload(n Notification) ([]byte, error) {
 	p := payload.NewPayload().
 		AlertTitle(n.Title).
 		AlertBody(n.Body).
@@ -61,6 +86,32 @@ func buildPayload(n Notification) ([]byte, error) {
 		p = p.Custom("snapshot_url", n.SnapshotURL)
 	}
 	return json.Marshal(p)
+}
+
+// buildMinimalPayload renders the privacy-minimal payload the gateway sends
+// through the relay: only the opaque event_id plus a generic placeholder alert.
+// It deliberately omits camera/label/snapshot_url/thread-id so the relay never
+// sees event content. The NSE (triggered by mutable-content) fetches the real
+// title/body/snapshot from the user's own gateway keyed by event_id; if that
+// fetch fails, the generic alert below still shows a banner.
+func buildMinimalPayload(n Notification) ([]byte, error) {
+	p := payload.NewPayload().
+		AlertTitle("Beacon").
+		AlertBody("New activity").
+		Sound("default").
+		MutableContent().
+		Custom("event_id", n.EventID)
+	return json.Marshal(p)
+}
+
+// buildAndroidDataPayload renders the FCM `data` map for the relay's FCM pusher —
+// the Android analog of buildMinimalPayload. Privacy-minimal by the same rule:
+// only the opaque event_id (FCM data values must be strings), so the relay never
+// sees event content; the Android app fetches title/body/snapshot from its OWN
+// gateway keyed by event_id. The FCM pusher wraps this under the message envelope
+// with the per-device token + HIGH priority to wake a closed app.
+func buildAndroidDataPayload(n Notification) ([]byte, error) {
+	return json.Marshal(map[string]string{"event_id": n.EventID})
 }
 
 // isUnregistered reports APNs reasons that mean the gateway should prune the
@@ -102,7 +153,22 @@ func NewDirectTransport(cfg config.APNs) (*DirectTransport, error) {
 
 func (d *DirectTransport) Name() string { return "direct" }
 
-func (d *DirectTransport) Deliver(ctx context.Context, environment string, deviceTokens []string, payloadBytes []byte) ([]Result, error) {
+// BuildPayload sends the full rich payload — the gateway holds the key, so no
+// third party sees the content. DirectTransport is iOS-only (see Deliver).
+func (d *DirectTransport) BuildPayload(platform string, n Notification) ([]byte, error) {
+	if platform != "" && platform != "ios" {
+		return nil, fmt.Errorf("direct transport supports iOS only, not platform %q", platform)
+	}
+	return buildRichPayload(n)
+}
+
+func (d *DirectTransport) Deliver(ctx context.Context, platform, environment string, deviceTokens []string, payloadBytes []byte) ([]Result, error) {
+	// DirectTransport signs with the gateway's own APNs .p8 — iOS only. A
+	// self-hoster wanting Android push must use the relay (FCM); reject other
+	// platforms rather than silently sending a non-APNs token to APNs.
+	if platform != "" && platform != "ios" {
+		return nil, fmt.Errorf("direct transport supports iOS only, not platform %q", platform)
+	}
 	client := d.prod
 	if environment == "sandbox" {
 		client = d.sandbox
@@ -151,9 +217,21 @@ func NewRelayTransport(baseURL, instanceToken string, client *http.Client) *Rela
 
 func (r *RelayTransport) Name() string { return "relay" }
 
-func (r *RelayTransport) Deliver(ctx context.Context, environment string, deviceTokens []string, payloadBytes []byte) ([]Result, error) {
+// BuildPayload sends the privacy-minimal payload (event_id only), shaped per
+// platform: an APNs payload for iOS, an FCM `data` map for Android. The relay
+// forwards it verbatim and never sees camera/label/snapshot; the on-device app
+// fetches those from the user's own gateway.
+func (r *RelayTransport) BuildPayload(platform string, n Notification) ([]byte, error) {
+	if platform == "android" {
+		return buildAndroidDataPayload(n)
+	}
+	return buildMinimalPayload(n)
+}
+
+func (r *RelayTransport) Deliver(ctx context.Context, platform, environment string, deviceTokens []string, payloadBytes []byte) ([]Result, error) {
 	reqBody := relay.PushRequest{
 		Environment:  environment,
+		Platform:     platform,
 		DeviceTokens: deviceTokens,
 		Payload:      json.RawMessage(payloadBytes),
 	}
@@ -174,6 +252,11 @@ func (r *RelayTransport) Deliver(ctx context.Context, environment string, device
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
+		// 402 = this instance's subscription lapsed. Surface it distinctly so the
+		// gateway can log it loudly rather than as an opaque "returned 402".
+		if resp.StatusCode == http.StatusPaymentRequired {
+			return nil, ErrSubscriptionInactive
+		}
 		return nil, fmt.Errorf("relay push returned %d", resp.StatusCode)
 	}
 	var out relay.PushResponse

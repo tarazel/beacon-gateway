@@ -3,6 +3,7 @@ package apns
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -71,7 +72,7 @@ func TestRelayTransport_EndToEnd(t *testing.T) {
 		t.Fatalf("Name = %q", tr.Name())
 	}
 
-	results, err := tr.Deliver(ctx, "production", []string{"live", "dead"}, []byte(`{"aps":{"mutable-content":1}}`))
+	results, err := tr.Deliver(ctx, "ios", "production", []string{"live", "dead"}, []byte(`{"aps":{"mutable-content":1}}`))
 	if err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}
@@ -102,7 +103,23 @@ func TestRelayTransport_PushRejectedWhenUnauthorized(t *testing.T) {
 	srv := newStubRelay(t, "reg-secret", "rk_test")
 	defer srv.Close()
 	tr := NewRelayTransport(srv.URL, "rk_bogus", srv.Client())
-	if _, err := tr.Deliver(context.Background(), "production", []string{"x"}, []byte(`{"aps":{}}`)); err == nil {
+	if _, err := tr.Deliver(context.Background(), "ios", "production", []string{"x"}, []byte(`{"aps":{}}`)); err == nil {
 		t.Fatal("expected error delivering with an unknown instance token")
+	}
+}
+
+// TestRelayTransport_SubscriptionInactive verifies a 402 from the relay (lapsed
+// subscription) surfaces as the ErrSubscriptionInactive sentinel, so the gateway
+// can log the dropped-push condition loudly instead of as an opaque HTTP error.
+func TestRelayTransport_SubscriptionInactive(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, `{"error":"subscription inactive"}`, http.StatusPaymentRequired)
+	}))
+	defer srv.Close()
+
+	tr := NewRelayTransport(srv.URL, "rk_test", srv.Client())
+	_, err := tr.Deliver(context.Background(), "ios", "production", []string{"x"}, []byte(`{"aps":{"mutable-content":1}}`))
+	if !errors.Is(err, ErrSubscriptionInactive) {
+		t.Fatalf("want ErrSubscriptionInactive, got %v", err)
 	}
 }

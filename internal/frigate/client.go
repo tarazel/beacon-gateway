@@ -8,7 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/hydak/beacon-gateway/internal/config"
@@ -33,6 +35,12 @@ var forwardedResponseHeaders = []string{
 type Client struct {
 	cfg       config.Frigate
 	streaming *http.Client
+
+	// Per-event locks serialize concurrent clip caching for the same id (e.g. a
+	// background pre-warm racing a user tapping the push), so ffmpeg never runs
+	// twice against the same temp files. Different ids still cache concurrently.
+	clipMu    sync.Mutex
+	clipLocks map[string]*sync.Mutex
 }
 
 func NewClient(cfg config.Frigate) *Client {
@@ -44,7 +52,23 @@ func NewClient(cfg config.Frigate) *Client {
 				IdleConnTimeout:       90 * time.Second,
 			},
 		},
+		clipLocks: make(map[string]*sync.Mutex),
 	}
+}
+
+// lockClip acquires the per-id clip lock and returns a release func. Callers must
+// defer the returned func. The lock is kept in the map after release (bounded by
+// the number of distinct events cached this process lifetime — small).
+func (c *Client) lockClip(id string) func() {
+	c.clipMu.Lock()
+	m, ok := c.clipLocks[id]
+	if !ok {
+		m = &sync.Mutex{}
+		c.clipLocks[id] = m
+	}
+	c.clipMu.Unlock()
+	m.Lock()
+	return m.Unlock
 }
 
 // Proxy forwards a GET to Frigate, including Range and conditional headers,
@@ -120,10 +144,19 @@ func (c *Client) ServeCachedClip(w http.ResponseWriter, r *http.Request, id, cac
 // both by ServeCachedClip and to proactively cache a clip when it gets pinned.
 func (c *Client) EnsureCachedClip(ctx context.Context, id, cacheDir string) (string, error) {
 	cachePath := filepath.Join(cacheDir, id+".mp4")
-	if info, err := os.Stat(cachePath); err != nil || info.Size() == 0 {
-		if err := c.cacheClip(ctx, id, cacheDir, cachePath); err != nil {
-			return "", err
-		}
+	// Fast path: already cached, no lock needed.
+	if info, err := os.Stat(cachePath); err == nil && info.Size() > 0 {
+		return cachePath, nil
+	}
+	// Serialize concurrent cachers of this id, then re-check: another caller may
+	// have finished the remux while we waited for the lock.
+	unlock := c.lockClip(id)
+	defer unlock()
+	if info, err := os.Stat(cachePath); err == nil && info.Size() > 0 {
+		return cachePath, nil
+	}
+	if err := c.cacheClip(ctx, id, cacheDir, cachePath); err != nil {
+		return "", err
 	}
 	return cachePath, nil
 }
@@ -185,24 +218,95 @@ func (c *Client) cacheClip(ctx context.Context, id, cacheDir, cachePath string) 
 	//     duration spans the whole clip. (Do NOT add -avoid_negative_ts
 	//     make_zero — empirically it shifted the video start ~64ms ahead of the
 	//     audio; plain genpts keeps both anchored at 0.)
+	//   - codec tag: only HEVC needs the hev1 -> hvc1 retag for AVPlayer. Tagging
+	//     an H.264 stream "hvc1" makes players read it as HEVC and fail, so the tag
+	//     is applied ONLY when the source is HEVC (see probeVideoCodec). This keeps
+	//     the remux correct whether the camera records H.265 or H.264.
+	//
+	// Corrupt-source path (TRACK.md EXT-1): Frigate's HEVC clip export sometimes
+	// emits frames smeared across hundreds of hours (non-monotonic DTS), which the
+	// async resampler above turns into a multi-hour clip — and actually HANGS
+	// ffmpeg (it tries to pad the giant gaps with silence). When the source
+	// duration is absurd we can't trust its timestamps at all, so we REBUILD them
+	// from frame/sample order instead: video re-timestamped at the camera's fps via
+	// the `setts` bitstream filter (still `-c copy`, no re-encode), audio via
+	// `asetpts` on consumed samples. Validated on-device against a 41h clip → ~56s.
+	codec := probeVideoCodec(ctx, raw)
+	corrupt := clipDurationSeconds(ctx, raw) > corruptClipDurationThreshold.Seconds()
+
 	tmp := cachePath + ".tmp"
-	cmd := exec.CommandContext(ctx, "ffmpeg",
-		"-nostdin", "-y",
-		"-fflags", "+genpts",
-		"-i", raw,
-		"-map", "0:v:0", "-map", "0:a:0?",
-		"-c:v", "copy",
-		"-c:a", "aac", "-b:a", "128k", "-af", "aresample=async=1:first_pts=0",
-		"-movflags", "+faststart",
-		"-tag:v", "hvc1",
-		"-f", "mp4", // temp file ends in .tmp, so force the muxer
-		tmp,
-	)
+	args := []string{"-nostdin", "-y"}
+	if !corrupt {
+		args = append(args, "-fflags", "+genpts")
+	}
+	args = append(args, "-i", raw, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy")
+	if corrupt {
+		args = append(args,
+			"-bsf:v", fmt.Sprintf("setts=pts=N/(%d*TB):dts=N/(%d*TB)", clipRebuildFPS, clipRebuildFPS),
+			"-c:a", "aac", "-b:a", "128k", "-af", "asetpts=NB_CONSUMED_SAMPLES/SR/TB")
+	} else {
+		args = append(args, "-c:a", "aac", "-b:a", "128k", "-af", "aresample=async=1:first_pts=0")
+	}
+	args = append(args, "-movflags", "+faststart")
+	if codec == "hevc" {
+		args = append(args, "-tag:v", "hvc1")
+	}
+	args = append(args, "-f", "mp4", tmp) // temp file ends in .tmp, so force the muxer
+
+	cmd := exec.CommandContext(ctx, "ffmpeg", args...)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		os.Remove(tmp)
 		return fmt.Errorf("ffmpeg remux clip: %w (%s)", err, lastLine(out))
 	}
 	return os.Rename(tmp, cachePath)
+}
+
+const (
+	// corruptClipDurationThreshold: a real Frigate event clip is at most minutes;
+	// anything past this is the EXT-1 timestamp corruption (frames smeared across
+	// hundreds of hours), which triggers the rebuild-timestamps remux path. Set
+	// generously so it can never false-positive on a legitimate event clip.
+	corruptClipDurationThreshold = 2 * time.Hour
+	// clipRebuildFPS is the frame rate used to rebuild timestamps for a corrupt
+	// clip (the deimos main stream runs at 20fps). The corrupt source's own frame
+	// rate is unreadable, so we assume the camera's configured rate.
+	clipRebuildFPS = 20
+)
+
+// probeVideoCodec returns the first video stream's codec name (e.g. "hevc",
+// "h264") via ffprobe, or "" if it can't be determined. Used to decide the
+// output codec tag in the remux.
+func probeVideoCodec(ctx context.Context, path string) string {
+	out, err := exec.CommandContext(ctx, "ffprobe",
+		"-v", "error",
+		"-select_streams", "v:0",
+		"-show_entries", "stream=codec_name",
+		"-of", "default=nw=1:nk=1",
+		path,
+	).Output()
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// clipDurationSeconds returns the container duration in seconds via ffprobe, or 0
+// if it can't be determined. Used to detect the EXT-1 corruption (absurd duration).
+func clipDurationSeconds(ctx context.Context, path string) float64 {
+	out, err := exec.CommandContext(ctx, "ffprobe",
+		"-v", "error",
+		"-show_entries", "format=duration",
+		"-of", "default=nw=1:nk=1",
+		path,
+	).Output()
+	if err != nil {
+		return 0
+	}
+	d, err := strconv.ParseFloat(strings.TrimSpace(string(out)), 64)
+	if err != nil {
+		return 0
+	}
+	return d
 }
 
 func lastLine(b []byte) string {

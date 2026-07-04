@@ -1,18 +1,22 @@
 # beacon-gateway
 
-**The open-source gateway for [beacon](https://frigate.video) — a self-hosted,
-Ring-style home security backend built on [Frigate](https://frigate.video).**
+**The open-source gateway for [Beacon](https://tarazel.com) — the family
+security app for your self-hosted [Frigate](https://frigate.video).**
 
-Frigate gives you object detection and recording. The beacon gateway gives you
-the *backend* for a real app: a small Go service in front of Frigate with
-reliable APNs push notifications, secure auth, per-camera family access, live
-view signaling, and clip playback. It always attaches to Frigate; Frigate stays
-the source of truth for events, snapshots, clips, and streams.
+Frigate gives you object detection and recording. The beacon gateway turns it
+into **a family security app** — a small Go service in front of Frigate that adds
+the one thing no thin Frigate client can: real multi-user. Every family member
+gets their own Sign in with Apple account and sees only the cameras you allow, and
+**nobody ever touches your Frigate login** — the gateway holds the credentials and
+brokers everything. Real push, secure auth, live-view signaling, and clip playback
+come with it. Frigate stays the source of truth for events, snapshots, clips, and
+streams.
 
 If you've wired Frigate up to ntfy or email for alerts, the gateway replaces
-that notification layer with real push **and** adds the parts ntfy never
-could — auth, per-user camera scope, WebRTC live-view signaling, and clip
-history.
+that notification layer with real push that fires even when the app is closed —
+**and** adds the parts a shared Frigate login never could: real accounts,
+per-user camera scope, single-use invite codes, WebRTC live-view signaling, and
+clip history.
 
 > Not affiliated with Ring or Amazon. "Ring-style" describes the experience, not
 > the product.
