@@ -10,6 +10,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -29,20 +30,46 @@ type AppleIdentity struct {
 }
 
 type AppleVerifier struct {
-	clientID string
-	http     *http.Client
+	// audiences is the set of accepted `aud` values. iOS presents the native app
+	// bundle id; the Android web (Sign in with Apple) flow presents an Apple
+	// Services ID — both must be accepted, so this is a set, not a single string.
+	audiences []string
+	http      *http.Client
 
 	mu        sync.Mutex
 	keys      map[string]*rsa.PublicKey
 	keysFetch time.Time
 }
 
-func NewAppleVerifier(clientID string) *AppleVerifier {
-	return &AppleVerifier{
-		clientID: clientID,
-		http:     &http.Client{Timeout: 10 * time.Second},
-		keys:     map[string]*rsa.PublicKey{},
+// NewAppleVerifier accepts one or more allowed audiences (empties/dupes dropped).
+func NewAppleVerifier(clientIDs ...string) *AppleVerifier {
+	seen := map[string]bool{}
+	auds := make([]string, 0, len(clientIDs))
+	for _, c := range clientIDs {
+		c = strings.TrimSpace(c)
+		if c == "" || seen[c] {
+			continue
+		}
+		seen[c] = true
+		auds = append(auds, c)
 	}
+	return &AppleVerifier{
+		audiences: auds,
+		http:      &http.Client{Timeout: 10 * time.Second},
+		keys:      map[string]*rsa.PublicKey{},
+	}
+}
+
+// audienceAllowed reports whether any of the token's audiences is accepted.
+func (v *AppleVerifier) audienceAllowed(aud []string) bool {
+	for _, a := range aud {
+		for _, allowed := range v.audiences {
+			if a == allowed {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (v *AppleVerifier) Verify(ctx context.Context, identityToken string) (*AppleIdentity, error) {
@@ -58,11 +85,17 @@ func (v *AppleVerifier) Verify(ctx context.Context, identityToken string) (*Appl
 		return v.keyFor(ctx, kid)
 	},
 		jwt.WithIssuer(appleIssuer),
-		jwt.WithAudience(v.clientID),
 		jwt.WithExpirationRequired(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf("verify apple token: %w", err)
+	}
+
+	// Audience is checked manually to accept a SET of allowed audiences (the iOS
+	// bundle id and the Android Services ID) — jwt.WithAudience only accepts one.
+	aud, _ := claims.GetAudience()
+	if !v.audienceAllowed(aud) {
+		return nil, errors.New("verify apple token: audience not allowed")
 	}
 
 	sub, _ := claims["sub"].(string)
