@@ -136,11 +136,13 @@ func (v *AppleVerifier) keyFor(ctx context.Context, kid string) (*rsa.PublicKey,
 	return key, nil
 }
 
-type appleJWKS struct {
-	Keys []appleJWK `json:"keys"`
+// rsaJWKS / rsaJWK model an RSA JWK set. Both Apple's and Google's key endpoints
+// serve this shape, so the Google verifier reuses these types and jwkToRSA.
+type rsaJWKS struct {
+	Keys []rsaJWK `json:"keys"`
 }
 
-type appleJWK struct {
+type rsaJWK struct {
 	Kty string `json:"kty"`
 	Kid string `json:"kid"`
 	Use string `json:"use"`
@@ -163,7 +165,7 @@ func (v *AppleVerifier) refreshKeys(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	var jwks appleJWKS
+	var jwks rsaJWKS
 	if err := json.Unmarshal(body, &jwks); err != nil {
 		return fmt.Errorf("parse apple jwks: %w", err)
 	}
@@ -187,7 +189,7 @@ func (v *AppleVerifier) refreshKeys(ctx context.Context) error {
 	return nil
 }
 
-func jwkToRSA(k appleJWK) (*rsa.PublicKey, error) {
+func jwkToRSA(k rsaJWK) (*rsa.PublicKey, error) {
 	nBytes, err := base64.RawURLEncoding.DecodeString(k.N)
 	if err != nil {
 		return nil, err

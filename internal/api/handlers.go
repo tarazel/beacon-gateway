@@ -16,6 +16,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/hydak/beacon-gateway/internal/apns"
 	"github.com/hydak/beacon-gateway/internal/auth"
 	"github.com/hydak/beacon-gateway/internal/cameras"
 	"github.com/hydak/beacon-gateway/internal/config"
@@ -26,21 +27,36 @@ import (
 	"github.com/hydak/beacon-gateway/internal/settings"
 )
 
+// CameraHealth reports per-camera offline state (see internal/camhealth). It's
+// an interface so handlers stay testable with a nil/stub; nil means "always
+// online" (no offline tag emitted).
+type CameraHealth interface {
+	Offline(id string) bool
+}
+
 type Handlers struct {
-	cfg         *config.Config
-	log         *slog.Logger
-	db          *sql.DB
-	users       *auth.Store
-	jwt         *auth.JWTIssuer
-	apple       *auth.AppleVerifier
-	events      *events.Store
-	frigate     *frigate.Client
-	cameras     *cameras.Registry
-	go2rtc      *go2rtc.Client
-	settings    *settings.Store
-	notifrules  *notifrules.Store
-	allowlist   map[string]struct{}
-	adminEmails map[string]struct{}
+	cfg          *config.Config
+	log          *slog.Logger
+	db           *sql.DB
+	users        *auth.Store
+	jwt          *auth.JWTIssuer
+	apple        *auth.AppleVerifier
+	google       *auth.GoogleVerifier
+	events       *events.Store
+	frigate      *frigate.Client
+	cameras      *cameras.Registry
+	go2rtc       *go2rtc.Client
+	settings     *settings.Store
+	notifrules   *notifrules.Store
+	cameraHealth CameraHealth
+	allowlist    map[string]struct{}
+	adminEmails  map[string]struct{}
+}
+
+// cameraOffline reports whether the camera should be tagged offline, tolerating
+// a nil health monitor (tests, or push-disabled builds).
+func (h *Handlers) cameraOffline(id string) bool {
+	return h.cameraHealth != nil && h.cameraHealth.Offline(id)
 }
 
 func NewHandlers(
@@ -50,12 +66,14 @@ func NewHandlers(
 	users *auth.Store,
 	jwt *auth.JWTIssuer,
 	apple *auth.AppleVerifier,
+	google *auth.GoogleVerifier,
 	eventStore *events.Store,
 	frigateClient *frigate.Client,
 	camRegistry *cameras.Registry,
 	go2rtcClient *go2rtc.Client,
 	settingsStore *settings.Store,
 	rulesStore *notifrules.Store,
+	cameraHealth CameraHealth,
 ) *Handlers {
 	allow := make(map[string]struct{}, len(cfg.Auth.AppleAllowedEmails))
 	for _, e := range cfg.Auth.AppleAllowedEmails {
@@ -66,20 +84,22 @@ func NewHandlers(
 		admins[strings.ToLower(strings.TrimSpace(e))] = struct{}{}
 	}
 	return &Handlers{
-		cfg:         cfg,
-		log:         log,
-		db:          db,
-		users:       users,
-		jwt:         jwt,
-		apple:       apple,
-		events:      eventStore,
-		frigate:     frigateClient,
-		cameras:     camRegistry,
-		go2rtc:      go2rtcClient,
-		settings:    settingsStore,
-		notifrules:  rulesStore,
-		allowlist:   allow,
-		adminEmails: admins,
+		cfg:          cfg,
+		log:          log,
+		db:           db,
+		users:        users,
+		jwt:          jwt,
+		apple:        apple,
+		google:       google,
+		events:       eventStore,
+		frigate:      frigateClient,
+		cameras:      camRegistry,
+		go2rtc:       go2rtcClient,
+		settings:     settingsStore,
+		notifrules:   rulesStore,
+		cameraHealth: cameraHealth,
+		allowlist:    allow,
+		adminEmails:  admins,
 	}
 }
 
@@ -89,6 +109,16 @@ func (h *Handlers) Healthz(w http.ResponseWriter, r *http.Request) {
 
 type appleSignInRequest struct {
 	IdentityToken string `json:"identity_token"`
+	Name          string `json:"name,omitempty"`
+	InviteCode    string `json:"invite_code,omitempty"`
+}
+
+type googleSignInRequest struct {
+	// IDToken is a Google Sign-In ID token (from Credential Manager on Android or
+	// the OAuth web/PKCE flow on iOS). id_token is the canonical field name; a
+	// legacy identity_token alias is also accepted for symmetry with Apple.
+	IDToken       string `json:"id_token"`
+	IdentityToken string `json:"identity_token,omitempty"`
 	Name          string `json:"name,omitempty"`
 	InviteCode    string `json:"invite_code,omitempty"`
 }
@@ -131,64 +161,202 @@ func (h *Handlers) AppleSignIn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "identity_token required")
 		return
 	}
-
 	id, err := h.apple.Verify(r.Context(), req.IdentityToken)
 	if err != nil {
 		h.log.Warn("apple verify failed", "err", err)
 		writeError(w, http.StatusUnauthorized, "invalid apple token")
 		return
 	}
+	h.completeProviderSignIn(w, r, providerSignIn{
+		provider:      auth.ProviderApple,
+		sub:           id.Sub,
+		email:         id.Email,
+		emailVerified: id.EmailVerified,
+		name:          req.Name,
+		inviteCode:    req.InviteCode,
+		rejectMsg:     "this Apple ID is not authorized — ask the owner for an invite",
+		idToken:       req.IdentityToken,
+	})
+}
 
-	user, err := h.users.GetUserByAppleSub(r.Context(), id.Sub)
+func (h *Handlers) GoogleSignIn(w http.ResponseWriter, r *http.Request) {
+	if h.google == nil || !h.google.Configured() {
+		writeError(w, http.StatusNotImplemented, "google sign-in is not configured on this gateway")
+		return
+	}
+	var req googleSignInRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "id_token required")
+		return
+	}
+	token := req.IDToken
+	if token == "" {
+		token = req.IdentityToken
+	}
+	if token == "" {
+		writeError(w, http.StatusBadRequest, "id_token required")
+		return
+	}
+	id, err := h.google.Verify(r.Context(), token)
+	if err != nil {
+		h.log.Warn("google verify failed", "err", err)
+		writeError(w, http.StatusUnauthorized, "invalid google token")
+		return
+	}
+	name := req.Name
+	if name == "" {
+		name = id.Name
+	}
+	h.completeProviderSignIn(w, r, providerSignIn{
+		provider:      auth.ProviderGoogle,
+		sub:           id.Sub,
+		email:         id.Email,
+		emailVerified: id.EmailVerified,
+		name:          name,
+		inviteCode:    req.InviteCode,
+		rejectMsg:     "this Google account is not authorized — ask the owner for an invite",
+		idToken:       token,
+	})
+}
+
+type providerSignIn struct {
+	provider      string
+	sub           string
+	email         string
+	emailVerified bool
+	name          string
+	inviteCode    string
+	rejectMsg     string
+	// idToken is the raw provider ID token the app presented. It's forwarded to the
+	// push relay to claim this instance on the owner's first admin sign-in (see
+	// maybeRegisterRelayAtSignIn) — the account-based, secret-free registration.
+	idToken string
+}
+
+// completeProviderSignIn is the shared tail of Apple and Google sign-in. It resolves
+// the identity to a user in three steps and issues tokens:
+//  1. an existing linked (provider, sub) → that user;
+//  2. else a verified email matching an existing user → link this identity to them
+//     (cross-provider account merge — the same person on a second platform);
+//  3. else a brand-new user → gated by the allowlist or a valid invite, then created.
+//
+// Only step 3 is gated: a returning user (steps 1–2) is already admitted, so an
+// invite-only member who later adds a second provider isn't re-challenged.
+func (h *Handlers) completeProviderSignIn(w http.ResponseWriter, r *http.Request, in providerSignIn) {
+	ctx := r.Context()
+
+	// 1. Known identity.
+	user, err := h.users.GetUserByProviderIdentity(ctx, in.provider, in.sub)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "user lookup failed")
 		return
 	}
-
-	if user == nil {
-		ctx := r.Context()
-		allowed := h.emailAllowed(ctx, id.Email)
-
-		// A pending invite admits a user who isn't on the allowlist, and carries
-		// the role + camera scope the admin chose for them.
-		var invite *auth.Invite
-		if code := normalizeInviteCode(req.InviteCode); code != "" {
-			if inv, err := h.users.GetInvite(ctx, code); err == nil && inv != nil && inv.Pending() {
-				invite = inv
-			}
-		}
-
-		if !allowed && invite == nil {
-			h.log.Warn("apple sign-in rejected: not allowlisted and no valid invite", "sub", id.Sub, "email", id.Email)
-			writeError(w, http.StatusForbidden, "this Apple ID is not authorized — ask the owner for an invite")
-			return
-		}
-
-		role := h.roleForNewUser(ctx, id.Email)
-		if invite != nil {
-			role = invite.Role
-		}
-		user, err = h.users.FindOrCreateUser(ctx, id.Sub, id.Email, req.Name, role)
-		if err != nil {
-			h.log.Error("create user failed", "err", err)
-			writeError(w, http.StatusInternalServerError, "user create failed")
-			return
-		}
-
-		if invite != nil {
-			if len(invite.Cameras) > 0 {
-				if err := h.users.SetUserCameras(ctx, user.ID, invite.Cameras); err != nil {
-					h.log.Warn("apply invite camera scope failed", "user_id", user.ID, "err", err)
-				}
-			}
-			if ok, err := h.users.ConsumeInvite(ctx, invite.Code, user.ID); err != nil || !ok {
-				h.log.Warn("consume invite failed/raced", "code", invite.Code, "ok", ok, "err", err)
-			}
-		}
-		h.log.Info("new user created", "user_id", user.ID, "role", user.Role, "email", id.Email, "via_invite", invite != nil)
+	if user != nil {
+		h.finishSignIn(w, ctx, in, user)
+		return
 	}
 
-	h.issueTokens(w, r.Context(), user.ID)
+	// 2. Same person, different provider — link on a verified email match.
+	if in.emailVerified && in.email != "" {
+		existing, err := h.users.GetUserByEmail(ctx, in.email)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "user lookup failed")
+			return
+		}
+		if existing != nil {
+			if err := h.users.LinkIdentity(ctx, existing.ID, in.provider, in.sub, in.email); err != nil {
+				h.log.Error("link identity failed", "err", err, "user_id", existing.ID, "provider", in.provider)
+				writeError(w, http.StatusInternalServerError, "account link failed")
+				return
+			}
+			h.log.Info("linked new identity to existing user", "user_id", existing.ID, "provider", in.provider, "email", in.email)
+			h.finishSignIn(w, ctx, in, existing)
+			return
+		}
+	}
+
+	// 3. New user — gate on allowlist or invite.
+	allowed := h.emailAllowed(ctx, in.email)
+	var invite *auth.Invite
+	if code := normalizeInviteCode(in.inviteCode); code != "" {
+		if inv, err := h.users.GetInvite(ctx, code); err == nil && inv != nil && inv.Pending() {
+			invite = inv
+		}
+	}
+	if !allowed && invite == nil {
+		h.log.Warn("sign-in rejected: not allowlisted and no valid invite", "provider", in.provider, "sub", in.sub, "email", in.email)
+		writeError(w, http.StatusForbidden, in.rejectMsg)
+		return
+	}
+
+	role := h.roleForNewUser(ctx, in.email)
+	if invite != nil {
+		role = invite.Role
+	}
+	// legacyAppleSub anchors the NOT NULL users.apple_sub column; empty lets the
+	// store synthesize "google:<sub>" for non-Apple providers.
+	legacyAppleSub := ""
+	if in.provider == auth.ProviderApple {
+		legacyAppleSub = in.sub
+	}
+	user, err = h.users.CreateUserWithIdentity(ctx, in.provider, in.sub, legacyAppleSub, in.email, in.name, role)
+	if err != nil {
+		h.log.Error("create user failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "user create failed")
+		return
+	}
+
+	if invite != nil {
+		if len(invite.Cameras) > 0 {
+			if err := h.users.SetUserCameras(ctx, user.ID, invite.Cameras); err != nil {
+				h.log.Warn("apply invite camera scope failed", "user_id", user.ID, "err", err)
+			}
+		}
+		if ok, err := h.users.ConsumeInvite(ctx, invite.Code, user.ID); err != nil || !ok {
+			h.log.Warn("consume invite failed/raced", "code", invite.Code, "ok", ok, "err", err)
+		}
+	}
+	h.log.Info("new user created", "user_id", user.ID, "role", user.Role, "provider", in.provider, "email", in.email, "via_invite", invite != nil)
+	h.finishSignIn(w, ctx, in, user)
+}
+
+// finishSignIn registers the gateway with the push relay on the owner's first
+// sign-in (best-effort; see maybeRegisterRelayAtSignIn), then issues app tokens.
+func (h *Handlers) finishSignIn(w http.ResponseWriter, ctx context.Context, in providerSignIn, u *auth.User) {
+	h.maybeRegisterRelayAtSignIn(ctx, in, u)
+	h.issueTokens(w, ctx, u.ID)
+}
+
+// maybeRegisterRelayAtSignIn claims this instance on the push relay using the
+// admin's verified provider ID token — the account-based, secret-free registration
+// that makes push work with zero pasted config. It runs only when relay mode is on,
+// the signing-in user is an admin (the instance owner), and no instance token is
+// stored yet. It's asynchronous and best-effort: it never blocks or fails sign-in,
+// and if the relay is unreachable it simply retries on the next admin sign-in. The
+// stored token is what buildPushTransport reads on each push.
+func (h *Handlers) maybeRegisterRelayAtSignIn(ctx context.Context, in providerSignIn, u *auth.User) {
+	if h.cfg.Relay.URL == "" || in.idToken == "" || u == nil || u.Role != auth.RoleAdmin {
+		return
+	}
+	if tok, err := h.settings.GetString(ctx, settings.KeyRelayInstanceToken, ""); err == nil && tok != "" {
+		return // already registered
+	}
+	provider, idToken := in.provider, in.idToken
+	go func() {
+		// Detached context: the sign-in request's ctx is canceled once it returns.
+		bg, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+		defer cancel()
+		resp, err := apns.RegisterWithRelay(bg, h.cfg.Relay.URL, provider, idToken, nil)
+		if err != nil {
+			h.log.Warn("relay registration failed; will retry on next admin sign-in", "err", err)
+			return
+		}
+		if err := h.settings.SetString(bg, settings.KeyRelayInstanceToken, resp.InstanceToken); err != nil {
+			h.log.Error("store relay instance token failed", "err", err)
+			return
+		}
+		h.log.Info("registered gateway with relay", "instance_id", resp.InstanceID, "plan", resp.Plan)
+	}()
 }
 
 // normalizeInviteCode upper-cases and trims an invite code for lookup.
@@ -703,6 +871,10 @@ func (h *Handlers) eventForUser(w http.ResponseWriter, r *http.Request, userID, 
 type cameraResp struct {
 	ID          string `json:"id"`
 	DisplayName string `json:"display_name"`
+	// Offline is true when the gateway has seen no live frames from this camera
+	// for the configured debounce window (CAMERA_OFFLINE_AFTER). Clients show an
+	// "offline" tag; no push is sent.
+	Offline bool `json:"offline"`
 }
 
 func (h *Handlers) ListCameras(w http.ResponseWriter, r *http.Request) {
@@ -728,7 +900,7 @@ func (h *Handlers) ListCameras(w http.ResponseWriter, r *http.Request) {
 				continue
 			}
 		}
-		out = append(out, cameraResp{ID: c.ID, DisplayName: c.DisplayName})
+		out = append(out, cameraResp{ID: c.ID, DisplayName: c.DisplayName, Offline: h.cameraOffline(c.ID)})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"cameras": out})
 }
@@ -742,6 +914,8 @@ type cameraLiveResp struct {
 	// tunnel doesn't carry, so it's LAN-only). It embeds a short-lived HLS token
 	// so the client can play it directly. Empty if the token couldn't be minted.
 	HLSURL string `json:"hls_url,omitempty"`
+	// Offline mirrors cameraResp.Offline for the live-view screen.
+	Offline bool `json:"offline"`
 }
 
 // hlsTokenTTL bounds a live-view session's HLS token. Long enough for a viewing
@@ -769,6 +943,7 @@ func (h *Handlers) CameraLive(w http.ResponseWriter, r *http.Request) {
 		DisplayName: cam.DisplayName,
 		Protocol:    "webrtc-whep",
 		WebRTCURL:   base + "/api/cameras/" + cam.ID + "/webrtc",
+		Offline:     h.cameraOffline(cam.ID),
 	}
 	if h.jwt != nil {
 		if tok, _, err := h.jwt.IssueHLS(userID, hlsTokenTTL); err == nil {

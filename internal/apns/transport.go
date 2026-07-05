@@ -26,6 +26,12 @@ import (
 // so a household's dropped pushes are never buried in a generic delivery error.
 var ErrSubscriptionInactive = errors.New("relay: Beacon Pro subscription inactive")
 
+// ErrNotRegistered is returned by RelayTransport.Deliver before the gateway has an
+// instance token — i.e. no admin has signed in yet to register it with the relay.
+// Sender treats it as a soft skip (there's nothing to deliver with) rather than a
+// hard error, so early pushes before first sign-in don't spam the logs.
+var ErrNotRegistered = errors.New("relay: gateway not registered yet")
+
 // Delivery status values, aligned with the relay's so results map 1:1 across
 // both transports.
 const (
@@ -199,19 +205,23 @@ func (d *DirectTransport) Deliver(ctx context.Context, platform, environment str
 type RelayTransport struct {
 	client  *http.Client
 	baseURL string
-	token   string
+	// tokenFn returns the current instance token at delivery time. It's a function
+	// (not a static string) because the gateway registers with the relay lazily —
+	// on the owner's first sign-in, after this transport is already constructed —
+	// and reads the resulting token from its settings store. Empty = not yet registered.
+	tokenFn func(context.Context) (string, error)
 }
 
-// NewRelayTransport builds a transport that POSTs to the relay's /v1/push using
-// the gateway's instance token.
-func NewRelayTransport(baseURL, instanceToken string, client *http.Client) *RelayTransport {
+// NewRelayTransport builds a transport that POSTs to the relay's /v1/push. tokenFn
+// supplies the gateway's instance token at delivery time (see the field doc).
+func NewRelayTransport(baseURL string, tokenFn func(context.Context) (string, error), client *http.Client) *RelayTransport {
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
 	return &RelayTransport{
 		client:  client,
 		baseURL: strings.TrimRight(baseURL, "/"),
-		token:   instanceToken,
+		tokenFn: tokenFn,
 	}
 }
 
@@ -229,6 +239,13 @@ func (r *RelayTransport) BuildPayload(platform string, n Notification) ([]byte, 
 }
 
 func (r *RelayTransport) Deliver(ctx context.Context, platform, environment string, deviceTokens []string, payloadBytes []byte) ([]Result, error) {
+	tok, err := r.tokenFn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("relay instance token: %w", err)
+	}
+	if tok == "" {
+		return nil, ErrNotRegistered
+	}
 	reqBody := relay.PushRequest{
 		Environment:  environment,
 		Platform:     platform,
@@ -244,7 +261,7 @@ func (r *RelayTransport) Deliver(ctx context.Context, platform, environment stri
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("Authorization", "Bearer "+r.token)
+	httpReq.Header.Set("Authorization", "Bearer "+tok)
 
 	resp, err := r.client.Do(httpReq)
 	if err != nil {
@@ -270,18 +287,22 @@ func (r *RelayTransport) Deliver(ctx context.Context, platform, environment stri
 	return results, nil
 }
 
-// RegisterWithRelay performs the gateway's first-boot registration, returning
-// the relay's response (whose InstanceToken the caller persists).
-func RegisterWithRelay(ctx context.Context, baseURL, registrationSecret string, client *http.Client) (*relay.RegisterResponse, error) {
+// RegisterWithRelay registers this gateway with the relay by forwarding the admin's
+// verified provider ID token (identity registration — no shared secret). The
+// returned InstanceToken is persisted by the caller and used for all later pushes.
+func RegisterWithRelay(ctx context.Context, baseURL, provider, idToken string, client *http.Client) (*relay.RegisterResponse, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/v1/register", strings.NewReader("{}"))
+	body, err := json.Marshal(relay.RegisterRequest{Provider: provider, IDToken: idToken})
+	if err != nil {
+		return nil, fmt.Errorf("marshal relay register: %w", err)
+	}
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, strings.TrimRight(baseURL, "/")+"/v1/register", bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
-	httpReq.Header.Set("X-Registration-Secret", registrationSecret)
 
 	resp, err := client.Do(httpReq)
 	if err != nil {

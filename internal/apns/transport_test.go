@@ -10,14 +10,20 @@ import (
 )
 
 // newStubRelay stands in for the central relay's HTTP API so the gateway's relay
-// client can be tested without importing the relay package. It accepts one
-// registration secret + one instance token, marks the device token "dead" as
+// client can be tested without importing the relay package. Registration is
+// identity-based: it accepts a provider + id_token body (rejecting an empty or
+// "bad" token), returns one instance token, marks the device token "dead" as
 // unregistered, and 401s pushes carrying an unknown bearer token.
-func newStubRelay(t *testing.T, regSecret, instanceToken string) *httptest.Server {
+func newStubRelay(t *testing.T, instanceToken string) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/register", func(w http.ResponseWriter, r *http.Request) {
-		if r.Header.Get("X-Registration-Secret") != regSecret {
+		var body struct {
+			Provider string `json:"provider"`
+			IDToken  string `json:"id_token"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if body.IDToken == "" || body.IDToken == "bad" {
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -51,15 +57,20 @@ func newStubRelay(t *testing.T, regSecret, instanceToken string) *httptest.Serve
 	return httptest.NewServer(mux)
 }
 
+// staticToken adapts a fixed token string to the RelayTransport tokenFn signature.
+func staticToken(tok string) func(context.Context) (string, error) {
+	return func(context.Context) (string, error) { return tok, nil }
+}
+
 // TestRelayTransport_EndToEnd exercises the gateway↔relay contract against a stub
-// relay: register to get an instance token, then deliver a push and map the
-// per-token results. The full relay-side test lives in the beacon-relay repo.
+// relay: register with an ID token to get an instance token, then deliver a push
+// and map the per-token results. The full relay-side test lives in beacon-relay.
 func TestRelayTransport_EndToEnd(t *testing.T) {
-	srv := newStubRelay(t, "reg-secret", "rk_test")
+	srv := newStubRelay(t, "rk_test")
 	defer srv.Close()
 	ctx := context.Background()
 
-	reg, err := RegisterWithRelay(ctx, srv.URL, "reg-secret", srv.Client())
+	reg, err := RegisterWithRelay(ctx, srv.URL, "apple", "good-id-token", srv.Client())
 	if err != nil {
 		t.Fatalf("RegisterWithRelay: %v", err)
 	}
@@ -67,7 +78,7 @@ func TestRelayTransport_EndToEnd(t *testing.T) {
 		t.Fatalf("instance token = %q, want rk_test", reg.InstanceToken)
 	}
 
-	tr := NewRelayTransport(srv.URL, reg.InstanceToken, srv.Client())
+	tr := NewRelayTransport(srv.URL, staticToken(reg.InstanceToken), srv.Client())
 	if tr.Name() != "relay" {
 		t.Fatalf("Name = %q", tr.Name())
 	}
@@ -91,20 +102,31 @@ func TestRelayTransport_EndToEnd(t *testing.T) {
 	}
 }
 
-func TestRegisterWithRelay_WrongSecret(t *testing.T) {
-	srv := newStubRelay(t, "reg-secret", "rk_test")
+func TestRegisterWithRelay_Rejected(t *testing.T) {
+	srv := newStubRelay(t, "rk_test")
 	defer srv.Close()
-	if _, err := RegisterWithRelay(context.Background(), srv.URL, "wrong", srv.Client()); err == nil {
-		t.Fatal("expected error registering with a wrong secret")
+	if _, err := RegisterWithRelay(context.Background(), srv.URL, "apple", "bad", srv.Client()); err == nil {
+		t.Fatal("expected error registering with a rejected id token")
 	}
 }
 
 func TestRelayTransport_PushRejectedWhenUnauthorized(t *testing.T) {
-	srv := newStubRelay(t, "reg-secret", "rk_test")
+	srv := newStubRelay(t, "rk_test")
 	defer srv.Close()
-	tr := NewRelayTransport(srv.URL, "rk_bogus", srv.Client())
+	tr := NewRelayTransport(srv.URL, staticToken("rk_bogus"), srv.Client())
 	if _, err := tr.Deliver(context.Background(), "ios", "production", []string{"x"}, []byte(`{"aps":{}}`)); err == nil {
 		t.Fatal("expected error delivering with an unknown instance token")
+	}
+}
+
+// TestRelayTransport_NotRegistered verifies that before the gateway has an instance
+// token (tokenFn returns ""), Deliver returns ErrNotRegistered rather than calling
+// the relay with an empty bearer.
+func TestRelayTransport_NotRegistered(t *testing.T) {
+	tr := NewRelayTransport("http://relay.invalid", staticToken(""), http.DefaultClient)
+	_, err := tr.Deliver(context.Background(), "ios", "production", []string{"x"}, []byte(`{"aps":{}}`))
+	if !errors.Is(err, ErrNotRegistered) {
+		t.Fatalf("want ErrNotRegistered, got %v", err)
 	}
 }
 
@@ -117,7 +139,7 @@ func TestRelayTransport_SubscriptionInactive(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tr := NewRelayTransport(srv.URL, "rk_test", srv.Client())
+	tr := NewRelayTransport(srv.URL, staticToken("rk_test"), srv.Client())
 	_, err := tr.Deliver(context.Background(), "ios", "production", []string{"x"}, []byte(`{"aps":{"mutable-content":1}}`))
 	if !errors.Is(err, ErrSubscriptionInactive) {
 		t.Fatalf("want ErrSubscriptionInactive, got %v", err)

@@ -19,6 +19,13 @@ const (
 	RoleMember = "member"
 )
 
+// Identity providers. A user may have one linked identity per provider (Apple on
+// their iPhone, Google on their Samsung), all resolving to the same account.
+const (
+	ProviderApple  = "apple"
+	ProviderGoogle = "google"
+)
+
 type User struct {
 	ID        string
 	AppleSub  string
@@ -118,28 +125,116 @@ func (s *Store) GetUserByAppleSub(ctx context.Context, appleSub string) (*User, 
 	return &u, nil
 }
 
+// FindOrCreateUser creates (or returns) a user keyed by an Apple sub. Retained for
+// the admin CLI's local dev-user path; real Apple/Google sign-in goes through the
+// provider-aware methods below. New users also get an 'apple' row in
+// user_identities so the identities table stays the complete source of truth.
 func (s *Store) FindOrCreateUser(ctx context.Context, appleSub, email, name, role string) (*User, error) {
 	if existing, err := s.GetUserByAppleSub(ctx, appleSub); err != nil {
 		return nil, err
 	} else if existing != nil {
 		return existing, nil
 	}
+	return s.CreateUserWithIdentity(ctx, ProviderApple, appleSub, appleSub, email, name, role)
+}
 
+// GetUserByProviderIdentity returns the user linked to (provider, sub), or nil if
+// no such identity is on file. This is the primary sign-in lookup.
+func (s *Store) GetUserByProviderIdentity(ctx context.Context, provider, sub string) (*User, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT u.id, u.apple_sub, u.email, u.name, u.role, u.created_at
+		FROM user_identities i JOIN users u ON u.id = i.user_id
+		WHERE i.provider = ? AND i.provider_sub = ?`, provider, sub)
+	var u User
+	var createdAt int64
+	var emailNS, nameNS sql.NullString
+	if err := row.Scan(&u.ID, &u.AppleSub, &emailNS, &nameNS, &u.Role, &createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	u.Email = emailNS.String
+	u.Name = nameNS.String
+	u.CreatedAt = time.Unix(createdAt, 0)
+	return &u, nil
+}
+
+// GetUserByEmail returns a user whose (case-insensitive) email matches, or nil.
+// Used for cross-provider account linking: a Google sign-in whose verified email
+// matches an existing Apple user is treated as the same person.
+func (s *Store) GetUserByEmail(ctx context.Context, email string) (*User, error) {
+	email = canonicalEmail(email)
+	if email == "" {
+		return nil, nil
+	}
+	row := s.db.QueryRowContext(ctx, `SELECT id, apple_sub, email, name, role, created_at FROM users WHERE LOWER(email) = ?`, email)
+	var u User
+	var createdAt int64
+	var emailNS, nameNS sql.NullString
+	if err := row.Scan(&u.ID, &u.AppleSub, &emailNS, &nameNS, &u.Role, &createdAt); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	u.Email = emailNS.String
+	u.Name = nameNS.String
+	u.CreatedAt = time.Unix(createdAt, 0)
+	return &u, nil
+}
+
+// LinkIdentity attaches (provider, sub) to an existing user. Idempotent: a repeat
+// link of the same identity to the same user is a no-op. If the identity is already
+// bound to a DIFFERENT user, it is left untouched and no error is returned (the
+// existing binding wins — we never silently move an identity between accounts).
+func (s *Store) LinkIdentity(ctx context.Context, userID, provider, sub, email string) error {
+	_, err := s.db.ExecContext(ctx, `
+		INSERT INTO user_identities (provider, provider_sub, user_id, email, created_at)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(provider, provider_sub) DO NOTHING`,
+		provider, sub, userID, nullable(email), time.Now().Unix(),
+	)
+	return err
+}
+
+// CreateUserWithIdentity creates a brand-new user with one linked identity, in a
+// single transaction. legacyAppleSub fills the NOT NULL users.apple_sub anchor: it
+// is the real Apple sub for Apple sign-ins, and a synthetic "google:<sub>" value
+// for other providers (see the 0009 migration note).
+func (s *Store) CreateUserWithIdentity(ctx context.Context, provider, sub, legacyAppleSub, email, name, role string) (*User, error) {
 	if role != RoleAdmin {
 		role = RoleMember
 	}
+	if legacyAppleSub == "" {
+		legacyAppleSub = provider + ":" + sub
+	}
 	u := User{
 		ID:        uuid.NewString(),
-		AppleSub:  appleSub,
+		AppleSub:  legacyAppleSub,
 		Email:     email,
 		Name:      name,
 		Role:      role,
 		CreatedAt: time.Now(),
 	}
-	if _, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO users (id, apple_sub, email, name, role, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		u.ID, u.AppleSub, nullable(u.Email), nullable(u.Name), u.Role, u.CreatedAt.Unix(),
 	); err != nil {
+		return nil, err
+	}
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO user_identities (provider, provider_sub, user_id, email, created_at) VALUES (?, ?, ?, ?, ?)`,
+		provider, sub, u.ID, nullable(email), u.CreatedAt.Unix(),
+	); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return &u, nil

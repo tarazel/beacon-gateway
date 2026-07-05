@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -14,6 +13,7 @@ import (
 	"github.com/hydak/beacon-gateway/internal/api"
 	"github.com/hydak/beacon-gateway/internal/apns"
 	"github.com/hydak/beacon-gateway/internal/auth"
+	"github.com/hydak/beacon-gateway/internal/camhealth"
 	"github.com/hydak/beacon-gateway/internal/cameras"
 	"github.com/hydak/beacon-gateway/internal/clips"
 	"github.com/hydak/beacon-gateway/internal/config"
@@ -56,6 +56,9 @@ func run() error {
 	appleVerifier := auth.NewAppleVerifier(
 		append([]string{cfg.Auth.AppleClientID}, cfg.Auth.AppleAllowedAudiences...)...,
 	)
+	googleVerifier := auth.NewGoogleVerifier(
+		append([]string{cfg.Auth.GoogleClientID}, cfg.Auth.GoogleAllowedAudiences...)...,
+	)
 	eventStore := events.NewStore(database)
 	settingsStore := settings.NewStore(database)
 	rulesStore := notifrules.NewStore(database)
@@ -63,13 +66,22 @@ func run() error {
 	cameraRegistry := cameras.NewRegistry(cfg.Cameras)
 	go2rtcClient := go2rtc.NewClient(cfg.Go2RTC.BaseURL)
 
+	// Poll Frigate for per-camera liveness so the API can surface an "offline"
+	// tag. Push is intentionally not wired to this — a flapping camera would spam.
+	camIDs := make([]string, 0, len(cfg.Cameras))
+	for _, c := range cameraRegistry.List() {
+		camIDs = append(camIDs, c.ID)
+	}
+	cameraHealth := camhealth.New(frigateClient.CameraFPS, camIDs, cfg.CameraHealth.PollInterval, cfg.CameraHealth.OfflineAfter, log)
+	go cameraHealth.Run(rootCtx)
+
 	pushTransport, err := buildPushTransport(rootCtx, cfg, settingsStore, log)
 	if err != nil {
 		return err
 	}
 	apnsSender := apns.NewSender(pushTransport, database, ruleAdapter{rulesStore}, cfg.APNs.UseSandbox, log)
 
-	handlers := api.NewHandlers(cfg, log, database, userStore, jwtIssuer, appleVerifier, eventStore, frigateClient, cameraRegistry, go2rtcClient, settingsStore, rulesStore)
+	handlers := api.NewHandlers(cfg, log, database, userStore, jwtIssuer, appleVerifier, googleVerifier, eventStore, frigateClient, cameraRegistry, go2rtcClient, settingsStore, rulesStore, cameraHealth)
 	router := api.NewRouter(handlers, jwtIssuer, userStore, log)
 
 	clipPruner := clips.NewPruner(cfg.ClipsDir(), log,
@@ -126,14 +138,18 @@ func run() error {
 // buildPushTransport chooses how the gateway delivers pushes: via the central
 // relay when RELAY_URL is set (the hosted/paid path), else directly to APNs with
 // the gateway's own .p8 (self-hosted), else nil (push disabled).
-func buildPushTransport(ctx context.Context, cfg *config.Config, settingsStore *settings.Store, log *slog.Logger) (apns.Transport, error) {
+func buildPushTransport(_ context.Context, cfg *config.Config, settingsStore *settings.Store, log *slog.Logger) (apns.Transport, error) {
 	if cfg.Relay.URL != "" {
-		token, err := ensureRelayRegistration(ctx, cfg, settingsStore, log)
-		if err != nil {
-			return nil, err
+		// The instance token is obtained lazily: the gateway registers with the relay
+		// on the owner's first sign-in (see api.Handlers), not at startup — there is
+		// no provider ID token to present until someone signs in. Read the token fresh
+		// from settings on each delivery so a mid-run registration is picked up without
+		// a restart; "" means not yet registered (Sender skips those pushes).
+		tokenFn := func(ctx context.Context) (string, error) {
+			return settingsStore.GetString(ctx, settings.KeyRelayInstanceToken, "")
 		}
 		log.Info("push transport: relay", "url", cfg.Relay.URL)
-		return apns.NewRelayTransport(cfg.Relay.URL, token, nil), nil
+		return apns.NewRelayTransport(cfg.Relay.URL, tokenFn, nil), nil
 	}
 	if cfg.APNsConfigured() {
 		dt, err := apns.NewDirectTransport(cfg.APNs)
@@ -144,30 +160,6 @@ func buildPushTransport(ctx context.Context, cfg *config.Config, settingsStore *
 		return dt, nil
 	}
 	return nil, nil
-}
-
-// ensureRelayRegistration returns the stored relay instance token, registering
-// with the relay on first boot (using RELAY_REGISTRATION_SECRET) if none exists.
-func ensureRelayRegistration(ctx context.Context, cfg *config.Config, settingsStore *settings.Store, log *slog.Logger) (string, error) {
-	tok, err := settingsStore.GetString(ctx, settings.KeyRelayInstanceToken, "")
-	if err != nil {
-		return "", err
-	}
-	if tok != "" {
-		return tok, nil
-	}
-	if cfg.Relay.RegistrationSecret == "" {
-		return "", fmt.Errorf("relay configured (RELAY_URL) but no stored instance token and RELAY_REGISTRATION_SECRET is unset")
-	}
-	resp, err := apns.RegisterWithRelay(ctx, cfg.Relay.URL, cfg.Relay.RegistrationSecret, nil)
-	if err != nil {
-		return "", fmt.Errorf("relay registration: %w", err)
-	}
-	if err := settingsStore.SetString(ctx, settings.KeyRelayInstanceToken, resp.InstanceToken); err != nil {
-		return "", fmt.Errorf("store relay instance token: %w", err)
-	}
-	log.Info("registered with relay", "instance_id", resp.InstanceID, "plan", resp.Plan)
-	return resp.InstanceToken, nil
 }
 
 // prewarmClip caches (downloads + remuxes) an event's clip ahead of any user
