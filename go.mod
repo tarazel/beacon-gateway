@@ -1,4 +1,4 @@
-module github.com/hydak/beacon-gateway
+module github.com/tarazel/beacon-gateway
 
 go 1.26.3
 

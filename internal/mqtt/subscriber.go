@@ -8,7 +8,7 @@ import (
 
 	mqttlib "github.com/eclipse/paho.mqtt.golang"
 
-	"github.com/hydak/beacon-gateway/internal/config"
+	"github.com/tarazel/beacon-gateway/internal/config"
 )
 
 type MessageHandler func(ctx context.Context, topic string, payload []byte)

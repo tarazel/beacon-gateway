@@ -9,12 +9,12 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hydak/beacon-gateway/internal/auth"
-	"github.com/hydak/beacon-gateway/internal/cameras"
-	"github.com/hydak/beacon-gateway/internal/config"
-	"github.com/hydak/beacon-gateway/internal/db"
-	"github.com/hydak/beacon-gateway/internal/events"
-	"github.com/hydak/beacon-gateway/internal/notifrules"
+	"github.com/tarazel/beacon-gateway/internal/auth"
+	"github.com/tarazel/beacon-gateway/internal/cameras"
+	"github.com/tarazel/beacon-gateway/internal/config"
+	"github.com/tarazel/beacon-gateway/internal/db"
+	"github.com/tarazel/beacon-gateway/internal/events"
+	"github.com/tarazel/beacon-gateway/internal/notifrules"
 )
 
 // newTestHandlers builds Handlers backed by a real temp SQLite store and seeds

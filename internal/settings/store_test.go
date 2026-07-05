@@ -5,8 +5,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/hydak/beacon-gateway/internal/db"
-	"github.com/hydak/beacon-gateway/internal/settings"
+	"github.com/tarazel/beacon-gateway/internal/db"
+	"github.com/tarazel/beacon-gateway/internal/settings"
 )
 
 func newStore(t *testing.T) *settings.Store {

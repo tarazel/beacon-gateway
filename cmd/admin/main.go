@@ -8,8 +8,8 @@ import (
 	"text/tabwriter"
 	"time"
 
-	"github.com/hydak/beacon-gateway/internal/auth"
-	"github.com/hydak/beacon-gateway/internal/db"
+	"github.com/tarazel/beacon-gateway/internal/auth"
+	"github.com/tarazel/beacon-gateway/internal/db"
 )
 
 const usageText = `beacon admin

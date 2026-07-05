@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hydak/beacon-gateway/internal/db"
+	"github.com/tarazel/beacon-gateway/internal/db"
 )
 
 func newTestStore(t *testing.T) (*Store, context.Context) {

@@ -16,8 +16,8 @@ import (
 	"github.com/sideshow/apns2/payload"
 	"github.com/sideshow/apns2/token"
 
-	"github.com/hydak/beacon-gateway/internal/config"
-	relay "github.com/hydak/beacon-gateway/internal/relayclient"
+	"github.com/tarazel/beacon-gateway/internal/config"
+	relay "github.com/tarazel/beacon-gateway/internal/relayclient"
 )
 
 // ErrSubscriptionInactive is returned by RelayTransport.Deliver when the relay

@@ -8,7 +8,7 @@ import (
 	"sort"
 	"testing"
 
-	"github.com/hydak/beacon-gateway/internal/db"
+	"github.com/tarazel/beacon-gateway/internal/db"
 )
 
 func discardLogger() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }

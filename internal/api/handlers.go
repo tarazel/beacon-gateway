@@ -16,15 +16,15 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/hydak/beacon-gateway/internal/apns"
-	"github.com/hydak/beacon-gateway/internal/auth"
-	"github.com/hydak/beacon-gateway/internal/cameras"
-	"github.com/hydak/beacon-gateway/internal/config"
-	"github.com/hydak/beacon-gateway/internal/events"
-	"github.com/hydak/beacon-gateway/internal/frigate"
-	"github.com/hydak/beacon-gateway/internal/go2rtc"
-	"github.com/hydak/beacon-gateway/internal/notifrules"
-	"github.com/hydak/beacon-gateway/internal/settings"
+	"github.com/tarazel/beacon-gateway/internal/apns"
+	"github.com/tarazel/beacon-gateway/internal/auth"
+	"github.com/tarazel/beacon-gateway/internal/cameras"
+	"github.com/tarazel/beacon-gateway/internal/config"
+	"github.com/tarazel/beacon-gateway/internal/events"
+	"github.com/tarazel/beacon-gateway/internal/frigate"
+	"github.com/tarazel/beacon-gateway/internal/go2rtc"
+	"github.com/tarazel/beacon-gateway/internal/notifrules"
+	"github.com/tarazel/beacon-gateway/internal/settings"
 )
 
 // CameraHealth reports per-camera offline state (see internal/camhealth). It's

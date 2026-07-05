@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/hydak/beacon-gateway/internal/config"
+	"github.com/tarazel/beacon-gateway/internal/config"
 )
 
 var forwardedRequestHeaders = []string{

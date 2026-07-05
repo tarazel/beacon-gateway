@@ -9,8 +9,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/hydak/beacon-gateway/internal/auth"
-	"github.com/hydak/beacon-gateway/internal/settings"
+	"github.com/tarazel/beacon-gateway/internal/auth"
+	"github.com/tarazel/beacon-gateway/internal/settings"
 )
 
 func TestCreateCheckout(t *testing.T) {

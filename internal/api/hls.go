@@ -7,7 +7,7 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/hydak/beacon-gateway/internal/auth"
+	"github.com/tarazel/beacon-gateway/internal/auth"
 )
 
 // HLS off-network live view.

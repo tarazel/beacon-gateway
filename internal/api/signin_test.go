@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hydak/beacon-gateway/internal/auth"
-	"github.com/hydak/beacon-gateway/internal/config"
-	"github.com/hydak/beacon-gateway/internal/db"
+	"github.com/tarazel/beacon-gateway/internal/auth"
+	"github.com/tarazel/beacon-gateway/internal/config"
+	"github.com/tarazel/beacon-gateway/internal/db"
 )
 
 // newSignInHandlers builds a Handlers with just the pieces the provider sign-in
