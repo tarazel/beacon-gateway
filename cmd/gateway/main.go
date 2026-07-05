@@ -53,7 +53,9 @@ func run() error {
 
 	userStore := auth.NewStore(database)
 	jwtIssuer := auth.NewJWTIssuer(cfg.Auth.JWTSigningKey, cfg.Auth.AccessTokenTTL)
-	appleVerifier := auth.NewAppleVerifier(cfg.Auth.AppleClientID)
+	appleVerifier := auth.NewAppleVerifier(
+		append([]string{cfg.Auth.AppleClientID}, cfg.Auth.AppleAllowedAudiences...)...,
+	)
 	eventStore := events.NewStore(database)
 	settingsStore := settings.NewStore(database)
 	rulesStore := notifrules.NewStore(database)

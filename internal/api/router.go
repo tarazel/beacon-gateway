@@ -13,6 +13,7 @@ func NewRouter(h *Handlers, jwtIssuer *auth.JWTIssuer, store *auth.Store, log *s
 
 	mux.HandleFunc("GET /healthz", h.Healthz)
 	mux.HandleFunc("POST /api/auth/apple", h.AppleSignIn)
+	mux.HandleFunc("POST /api/auth/apple/callback", h.AppleCallback)
 	mux.HandleFunc("POST /api/auth/refresh", h.Refresh)
 
 	protected := auth.Middleware(jwtIssuer)

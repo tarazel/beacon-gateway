@@ -73,7 +73,11 @@ type Auth struct {
 	// notification service extension uses to fetch snapshots (it can't refresh).
 	MediaTokenTTL      time.Duration
 	AppleClientID      string
-	AppleAllowedEmails []string
+	// AppleAllowedAudiences are additional accepted `aud` values beyond
+	// AppleClientID — e.g. the Apple Services ID used by the Android
+	// Sign-in-with-Apple web flow. Comma-separated in APPLE_ALLOWED_AUDIENCES.
+	AppleAllowedAudiences []string
+	AppleAllowedEmails    []string
 	// AdminEmails are promoted to the 'admin' role on sign-in. Independent of the
 	// first-user bootstrap (which makes whoever signs in first the owner/admin).
 	AdminEmails []string
@@ -125,8 +129,9 @@ func Load() (*Config, error) {
 			AccessTokenTTL:     getDuration("ACCESS_TOKEN_TTL", 15*time.Minute),
 			RefreshTokenTTL:    getDuration("REFRESH_TOKEN_TTL", 90*24*time.Hour),
 			MediaTokenTTL:      getDuration("MEDIA_TOKEN_TTL", 30*24*time.Hour),
-			AppleClientID:      os.Getenv("APPLE_CLIENT_ID"),
-			AppleAllowedEmails: splitCSV(os.Getenv("APPLE_ALLOWED_EMAILS")),
+			AppleClientID:         os.Getenv("APPLE_CLIENT_ID"),
+			AppleAllowedAudiences: splitCSV(os.Getenv("APPLE_ALLOWED_AUDIENCES")),
+			AppleAllowedEmails:    splitCSV(os.Getenv("APPLE_ALLOWED_EMAILS")),
 			AdminEmails:        splitCSV(os.Getenv("ADMIN_EMAILS")),
 		},
 		APNs: APNs{

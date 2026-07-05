@@ -101,6 +101,30 @@ type tokenResponse struct {
 	UserID       string    `json:"user_id"`
 }
 
+// appleCallbackScheme is where AppleCallback bounces the identity token so the
+// Android app can capture it (matches the intent filter in the app's manifest).
+const appleCallbackScheme = "beacon-auth://callback"
+
+// AppleCallback receives Apple's Sign in with Apple web-flow form_post (the Android
+// path: response_mode=form_post) and 302-redirects the identity token back to the
+// app via its custom scheme. It does NOT verify the token — that happens on
+// POST /api/auth/apple — and the app validates the `state` it minted. This is only
+// the browser→app handoff Apple's web flow requires.
+func (h *Handlers) AppleCallback(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "invalid form", http.StatusBadRequest)
+		return
+	}
+	q := url.Values{}
+	if e := r.FormValue("error"); e != "" {
+		q.Set("error", e)
+	} else {
+		q.Set("id_token", r.FormValue("id_token"))
+		q.Set("state", r.FormValue("state"))
+	}
+	http.Redirect(w, r, appleCallbackScheme+"?"+q.Encode(), http.StatusFound)
+}
+
 func (h *Handlers) AppleSignIn(w http.ResponseWriter, r *http.Request) {
 	var req appleSignInRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.IdentityToken == "" {
