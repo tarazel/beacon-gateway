@@ -6,7 +6,8 @@ security app for your self-hosted [Frigate](https://frigate.video).**
 Frigate gives you object detection and recording. The beacon gateway turns it
 into **a family security app** — a small Go service in front of Frigate that adds
 the one thing no thin Frigate client can: real multi-user. Every family member
-gets their own Sign in with Apple account and sees only the cameras you allow, and
+gets their own account (Sign in with Apple or Google) and sees only the cameras you
+allow, and
 **nobody ever touches your Frigate login** — the gateway holds the credentials and
 brokers everything. Real push, secure auth, live-view signaling, and clip playback
 come with it. Frigate stays the source of truth for events, snapshots, clips, and
@@ -68,7 +69,10 @@ Minimum config to edit in `.env`:
 - `CAMERAS_JSON` — one entry per camera; `stream` must be the **H.264 substream**
   (see the hard rule below).
 - `JWT_SIGNING_KEY` — `openssl rand -base64 48`.
-- `APPLE_CLIENT_ID` — your iOS app's bundle ID.
+- `APPLE_CLIENT_ID` — your iOS app's bundle ID (Sign in with Apple).
+- `GOOGLE_CLIENT_ID` / `GOOGLE_ALLOWED_AUDIENCES` — optional; set to enable Sign in
+  with Google (the Web/server OAuth client id, plus the iOS client id as an extra
+  audience). Leave blank to disable Google sign-in (the endpoint returns 501).
 - `APNS_*` — your `.p8` key + IDs for direct push (omit to use a relay instead).
 
 ## Users, roles, and invites

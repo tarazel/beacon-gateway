@@ -2,6 +2,7 @@ package frigate
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
@@ -122,6 +123,43 @@ func (c *Client) applyAuth(req *http.Request) {
 		req.Header.Set("CF-Access-Client-Id", c.cfg.CFAccessClientID)
 		req.Header.Set("CF-Access-Client-Secret", c.cfg.CFAccessClientSecret)
 	}
+}
+
+// CameraFPS fetches Frigate's /api/stats and returns each camera's current
+// source frame rate (camera_fps), keyed by Frigate camera id. A camera reporting
+// 0 has no live frames — ffmpeg has crashed, the RTSP stream is unreachable, or
+// the camera is down. The camera-health monitor polls this to flag offline
+// cameras. Uses the caller's context for cancellation/timeout.
+func (c *Client) CameraFPS(ctx context.Context) (map[string]float64, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+"/api/stats", nil)
+	if err != nil {
+		return nil, err
+	}
+	c.applyAuth(req)
+
+	resp, err := c.streaming.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("frigate stats: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("frigate stats status %d", resp.StatusCode)
+	}
+
+	var stats struct {
+		Cameras map[string]struct {
+			CameraFPS float64 `json:"camera_fps"`
+		} `json:"cameras"`
+	}
+	// Cap the read: /api/stats is a few KB, and this runs on a timer.
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&stats); err != nil {
+		return nil, fmt.Errorf("frigate stats decode: %w", err)
+	}
+	out := make(map[string]float64, len(stats.Cameras))
+	for name, s := range stats.Cameras {
+		out[name] = s.CameraFPS
+	}
+	return out, nil
 }
 
 // ServeCachedClip serves event clip <id> with full HTTP Range support.

@@ -173,6 +173,13 @@ func (s *Sender) SendToAll(ctx context.Context, n Notification) error {
 		}
 		res, derr := s.transport.Deliver(ctx, platform, env, toks, payloadBytes)
 		if derr != nil {
+			// Relay mode, but the gateway hasn't registered yet (no admin has signed in
+			// to claim the instance). Transient: skip quietly and let pushes resume once
+			// the owner signs in and registration completes.
+			if errors.Is(derr, ErrNotRegistered) {
+				s.log.Info("apns skipped: relay registration pending (owner not signed in yet)", "event_id", n.EventID, "camera", n.Camera)
+				return nil
+			}
 			// A lapsed subscription drops the whole household's pushes. Never let that
 			// be silent — log it loudly and distinctly (the app surfaces the same state
 			// via GET /api/subscription). The caller still gets the sentinel.

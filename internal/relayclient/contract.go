@@ -41,6 +41,16 @@ type PushResponse struct {
 	Results []PushResult `json:"results"`
 }
 
+// RegisterRequest is the body of POST /v1/register. The gateway forwards the
+// admin's verified provider ID token so the relay can bind the instance to that
+// identity — no shared secret. (The relay also still accepts a legacy
+// X-Registration-Secret header, which the gateway no longer sends by default.)
+type RegisterRequest struct {
+	Provider string `json:"provider"` // "apple" | "google"
+	IDToken  string `json:"id_token"`
+	Label    string `json:"label,omitempty"`
+}
+
 // RegisterResponse is returned once from POST /v1/register. instance_token is
 // shown exactly once. Plan/SubStatus are plain strings here (the gateway only
 // logs them); the relay defines them as typed enums.
