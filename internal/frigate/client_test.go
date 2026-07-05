@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/hydak/beacon-gateway/internal/config"
+	"github.com/tarazel/beacon-gateway/internal/config"
 )
 
 func TestProxyForwardsRangeAndCFHeaders(t *testing.T) {

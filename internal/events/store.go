@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hydak/beacon-gateway/internal/frigate"
+	"github.com/tarazel/beacon-gateway/internal/frigate"
 )
 
 type Event struct {

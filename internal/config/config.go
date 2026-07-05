@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/hydak/beacon-gateway/internal/cameras"
+	"github.com/tarazel/beacon-gateway/internal/cameras"
 )
 
 type Config struct {

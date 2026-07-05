@@ -7,8 +7,8 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/hydak/beacon-gateway/internal/apns"
-	"github.com/hydak/beacon-gateway/internal/settings"
+	"github.com/tarazel/beacon-gateway/internal/apns"
+	"github.com/tarazel/beacon-gateway/internal/settings"
 )
 
 type checkoutRequest struct {

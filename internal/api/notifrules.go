@@ -4,8 +4,8 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/hydak/beacon-gateway/internal/auth"
-	"github.com/hydak/beacon-gateway/internal/notifrules"
+	"github.com/tarazel/beacon-gateway/internal/auth"
+	"github.com/tarazel/beacon-gateway/internal/notifrules"
 )
 
 // GetNotificationRules returns the caller's own notification rules (the allow-all

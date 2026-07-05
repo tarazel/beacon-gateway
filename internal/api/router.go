@@ -5,7 +5,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/hydak/beacon-gateway/internal/auth"
+	"github.com/tarazel/beacon-gateway/internal/auth"
 )
 
 func NewRouter(h *Handlers, jwtIssuer *auth.JWTIssuer, store *auth.Store, log *slog.Logger) http.Handler {
