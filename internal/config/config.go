@@ -119,6 +119,15 @@ type Relay struct {
 // and sign push themselves with their own APNs .p8 (DirectTransport).
 const DefaultRelayURL = "https://relay.tarazel.com"
 
+// DefaultAppleServicesID is the Apple Services ID the published Tarazel app uses
+// as the `aud` of its Sign in with Apple **web-flow** token (the Android path).
+// It's always accepted (unioned with APPLE_ALLOWED_AUDIENCES) so a self-hoster
+// running the published app gets SIWA-on-Android with zero config. Harmless for
+// anyone who rebuilds under their own identity: tokens are still Apple-signature-
+// verified and gated by the allowlist/invite, so accepting this `aud` grants
+// nothing on its own. Mirrors the relay's AppleAudiences default.
+const DefaultAppleServicesID = "org.tarazel.beacon.signin"
+
 // relayURL resolves RELAY_URL: unset → the hosted relay default; an explicit
 // off/none/direct/"" → disabled (empty, direct mode); anything else → that URL.
 func relayURL() string {
@@ -174,7 +183,7 @@ func Load() (*Config, error) {
 			RefreshTokenTTL:        getDuration("REFRESH_TOKEN_TTL", 90*24*time.Hour),
 			MediaTokenTTL:          getDuration("MEDIA_TOKEN_TTL", 30*24*time.Hour),
 			AppleClientID:          os.Getenv("APPLE_CLIENT_ID"),
-			AppleAllowedAudiences:  splitCSV(os.Getenv("APPLE_ALLOWED_AUDIENCES")),
+			AppleAllowedAudiences:  withDefault(splitCSV(os.Getenv("APPLE_ALLOWED_AUDIENCES")), DefaultAppleServicesID),
 			GoogleClientID:         os.Getenv("GOOGLE_CLIENT_ID"),
 			GoogleAllowedAudiences: splitCSV(os.Getenv("GOOGLE_ALLOWED_AUDIENCES")),
 			AppleAllowedEmails:     splitCSV(os.Getenv("APPLE_ALLOWED_EMAILS")),
@@ -282,4 +291,15 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// withDefault returns vals with def appended unless it's already present, so a
+// baked-in default audience is accepted without duplicating an operator-supplied one.
+func withDefault(vals []string, def string) []string {
+	for _, v := range vals {
+		if v == def {
+			return vals
+		}
+	}
+	return append(vals, def)
 }
