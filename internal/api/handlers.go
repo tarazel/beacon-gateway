@@ -7,6 +7,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/url"
 	"sort"
@@ -34,6 +35,13 @@ type CameraHealth interface {
 	Offline(id string) bool
 }
 
+// MQTTStatus reports the live broker connection state for the health endpoint.
+// An interface so handlers stay testable with a nil/stub; nil means "unknown"
+// (reported as not connected).
+type MQTTStatus interface {
+	Connected() bool
+}
+
 type Handlers struct {
 	cfg          *config.Config
 	log          *slog.Logger
@@ -49,6 +57,8 @@ type Handlers struct {
 	settings     *settings.Store
 	notifrules   *notifrules.Store
 	cameraHealth CameraHealth
+	mqtt         MQTTStatus
+	startTime    time.Time
 	allowlist    map[string]struct{}
 	adminEmails  map[string]struct{}
 }
@@ -74,6 +84,7 @@ func NewHandlers(
 	settingsStore *settings.Store,
 	rulesStore *notifrules.Store,
 	cameraHealth CameraHealth,
+	mqttStatus MQTTStatus,
 ) *Handlers {
 	allow := make(map[string]struct{}, len(cfg.Auth.AppleAllowedEmails))
 	for _, e := range cfg.Auth.AppleAllowedEmails {
@@ -98,6 +109,8 @@ func NewHandlers(
 		settings:     settingsStore,
 		notifrules:   rulesStore,
 		cameraHealth: cameraHealth,
+		mqtt:         mqttStatus,
+		startTime:    time.Now(),
 		allowlist:    allow,
 		adminEmails:  admins,
 	}
@@ -903,6 +916,141 @@ func (h *Handlers) ListCameras(w http.ResponseWriter, r *http.Request) {
 		out = append(out, cameraResp{ID: c.ID, DisplayName: c.DisplayName, Offline: h.cameraOffline(c.ID)})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"cameras": out})
+}
+
+// --- System health (admin-only diagnostic surface) ---
+
+type systemHealthResp struct {
+	Gateway gatewayHealthResp `json:"gateway"`
+	Frigate frigateHealthResp `json:"frigate"`
+	Cameras []cameraHealthResp `json:"cameras"`
+}
+
+type gatewayHealthResp struct {
+	UptimeSeconds int64          `json:"uptime_seconds"`
+	MQTTConnected bool           `json:"mqtt_connected"`
+	Push          pushHealthResp `json:"push"`
+}
+
+type pushHealthResp struct {
+	Transport  string `json:"transport"`  // "relay" | "direct" | "disabled"
+	Registered bool   `json:"registered"` // relay only: instance token present
+}
+
+type frigateHealthResp struct {
+	Reachable     bool                `json:"reachable"`
+	Version       string              `json:"version,omitempty"`
+	UptimeSeconds int64               `json:"uptime_seconds,omitempty"`
+	DetectionFPS  float64             `json:"detection_fps"`
+	Detectors     []detectorHealthResp `json:"detectors"`
+	Storage       []storageHealthResp  `json:"storage"`
+}
+
+type detectorHealthResp struct {
+	Name             string  `json:"name"`
+	InferenceSpeedMs float64 `json:"inference_speed_ms"`
+}
+
+type storageHealthResp struct {
+	Path    string  `json:"path"`
+	UsedGB  float64 `json:"used_gb"`
+	TotalGB float64 `json:"total_gb"`
+	UsedPct float64 `json:"used_pct"`
+}
+
+type cameraHealthResp struct {
+	ID           string  `json:"id"`
+	DisplayName  string  `json:"display_name"`
+	Offline      bool    `json:"offline"`
+	CameraFPS    float64 `json:"camera_fps"`
+	DetectionFPS float64 `json:"detection_fps"`
+	ProcessFPS   float64 `json:"process_fps"`
+}
+
+// SystemHealth aggregates gateway, Frigate, and per-camera health into one
+// payload for the app's diagnostics screen. Admin-only (owner surface). It
+// degrades gracefully: if Frigate's /api/stats is unreachable, frigate.reachable
+// is false and cameras still render (offline from the camhealth monitor, FPS 0)
+// — the whole point of a health view is to work when things are down.
+func (h *Handlers) SystemHealth(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	// Gateway self-status — derivable without touching Frigate.
+	transport := "disabled"
+	registered := false
+	if h.cfg.Relay.URL != "" {
+		transport = "relay"
+		if tok, err := h.settings.GetString(ctx, settings.KeyRelayInstanceToken, ""); err == nil && tok != "" {
+			registered = true
+		}
+	} else if h.cfg.APNsConfigured() {
+		transport = "direct"
+	}
+	mqttConnected := h.mqtt != nil && h.mqtt.Connected()
+
+	resp := systemHealthResp{
+		Gateway: gatewayHealthResp{
+			UptimeSeconds: int64(time.Since(h.startTime).Seconds()),
+			MQTTConnected: mqttConnected,
+			Push:          pushHealthResp{Transport: transport, Registered: registered},
+		},
+		Frigate: frigateHealthResp{Detectors: []detectorHealthResp{}, Storage: []storageHealthResp{}},
+		Cameras: []cameraHealthResp{},
+	}
+
+	// Frigate stats — best effort. On failure, report unreachable and still emit
+	// per-camera rows (fps 0) with offline state from the health monitor.
+	stats, err := h.frigate.Stats(ctx)
+	if err != nil {
+		h.log.Warn("system health: frigate stats unavailable", "err", err)
+	} else {
+		resp.Frigate.Reachable = true
+		resp.Frigate.Version = stats.Service.Version
+		resp.Frigate.UptimeSeconds = int64(stats.Service.Uptime)
+		resp.Frigate.DetectionFPS = stats.DetectionFPS
+		for name, d := range stats.Detectors {
+			resp.Frigate.Detectors = append(resp.Frigate.Detectors, detectorHealthResp{
+				Name:             name,
+				InferenceSpeedMs: d.InferenceSpeed,
+			})
+		}
+		sort.Slice(resp.Frigate.Detectors, func(i, j int) bool {
+			return resp.Frigate.Detectors[i].Name < resp.Frigate.Detectors[j].Name
+		})
+		for path, s := range stats.Service.Storage {
+			usedGB := s.Used / 1024
+			totalGB := s.Total / 1024
+			pct := 0.0
+			if s.Total > 0 {
+				pct = s.Used / s.Total * 100
+			}
+			resp.Frigate.Storage = append(resp.Frigate.Storage, storageHealthResp{
+				Path:    path,
+				UsedGB:  math.Round(usedGB*10) / 10,
+				TotalGB: math.Round(totalGB*10) / 10,
+				UsedPct: math.Round(pct*10) / 10,
+			})
+		}
+		sort.Slice(resp.Frigate.Storage, func(i, j int) bool {
+			return resp.Frigate.Storage[i].Path < resp.Frigate.Storage[j].Path
+		})
+	}
+
+	// Per-camera rows: display name + offline from the gateway, FPS from Frigate
+	// stats (keyed by camera id, 0 when stats are unavailable or the camera is down).
+	for _, c := range h.cameras.List() {
+		row := cameraHealthResp{ID: c.ID, DisplayName: c.DisplayName, Offline: h.cameraOffline(c.ID)}
+		if stats != nil {
+			if s, ok := stats.Cameras[c.ID]; ok {
+				row.CameraFPS = s.CameraFPS
+				row.DetectionFPS = s.DetectionFPS
+				row.ProcessFPS = s.ProcessFPS
+			}
+		}
+		resp.Cameras = append(resp.Cameras, row)
+	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 type cameraLiveResp struct {

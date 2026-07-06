@@ -81,7 +81,11 @@ func run() error {
 	}
 	apnsSender := apns.NewSender(pushTransport, database, ruleAdapter{rulesStore}, cfg.APNs.UseSandbox, log)
 
-	handlers := api.NewHandlers(cfg, log, database, userStore, jwtIssuer, appleVerifier, googleVerifier, eventStore, frigateClient, cameraRegistry, go2rtcClient, settingsStore, rulesStore, cameraHealth)
+	// Constructed here (before handlers) so the health endpoint can report the
+	// live broker connection; Start()/Stop() are wired below.
+	mqttSub := mqtt.New(cfg.MQTT, log, eventDispatcher(log, eventStore, apnsSender, frigateClient, cfg))
+
+	handlers := api.NewHandlers(cfg, log, database, userStore, jwtIssuer, appleVerifier, googleVerifier, eventStore, frigateClient, cameraRegistry, go2rtcClient, settingsStore, rulesStore, cameraHealth, mqttSub)
 	router := api.NewRouter(handlers, jwtIssuer, userStore, log)
 
 	clipPruner := clips.NewPruner(cfg.ClipsDir(), log,
@@ -112,7 +116,6 @@ func run() error {
 		}
 	}()
 
-	mqttSub := mqtt.New(cfg.MQTT, log, eventDispatcher(log, eventStore, apnsSender, frigateClient, cfg))
 	go func() {
 		if err := mqttSub.Start(rootCtx); err != nil {
 			log.Warn("mqtt failed to start; will keep retrying in background", "err", err)

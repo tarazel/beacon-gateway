@@ -162,6 +162,66 @@ func (c *Client) CameraFPS(ctx context.Context) (map[string]float64, error) {
 	return out, nil
 }
 
+// Stats is the subset of Frigate's /api/stats surfaced by the system-health
+// endpoint: per-camera frame rates, detector inference speed, storage usage,
+// plus Frigate's version and uptime. Storage figures are in MB (Frigate's unit).
+type Stats struct {
+	Cameras      map[string]CameraStat   `json:"cameras"`
+	Detectors    map[string]DetectorStat `json:"detectors"`
+	DetectionFPS float64                 `json:"detection_fps"`
+	Service      ServiceStat             `json:"service"`
+}
+
+type CameraStat struct {
+	CameraFPS    float64 `json:"camera_fps"`
+	DetectionFPS float64 `json:"detection_fps"`
+	ProcessFPS   float64 `json:"process_fps"`
+	SkippedFPS   float64 `json:"skipped_fps"`
+}
+
+type DetectorStat struct {
+	InferenceSpeed float64 `json:"inference_speed"` // milliseconds
+}
+
+type ServiceStat struct {
+	Version string                 `json:"version"`
+	Uptime  float64                `json:"uptime"` // seconds
+	Storage map[string]StorageStat `json:"storage"`
+}
+
+type StorageStat struct {
+	Free      float64 `json:"free"`  // MB
+	Total     float64 `json:"total"` // MB
+	Used      float64 `json:"used"`  // MB
+	MountType string  `json:"mount_type"`
+}
+
+// Stats fetches and parses Frigate's /api/stats for the health endpoint. Unlike
+// CameraFPS (called on a timer, so kept minimal), this is on-demand and returns
+// the richer payload. Uses the caller's context for cancellation/timeout.
+func (c *Client) Stats(ctx context.Context) (*Stats, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+"/api/stats", nil)
+	if err != nil {
+		return nil, err
+	}
+	c.applyAuth(req)
+
+	resp, err := c.streaming.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("frigate stats: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("frigate stats status %d", resp.StatusCode)
+	}
+
+	var stats Stats
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&stats); err != nil {
+		return nil, fmt.Errorf("frigate stats decode: %w", err)
+	}
+	return &stats, nil
+}
+
 // ServeCachedClip serves event clip <id> with full HTTP Range support.
 // Frigate generates clips on-demand as a streamed ffmpeg remux with no
 // Content-Length and no Range support, which AVPlayer cannot play. So on the

@@ -32,6 +32,9 @@ func NewRouter(h *Handlers, jwtIssuer *auth.JWTIssuer, store *auth.Store, log *s
 	mux.Handle("GET /api/me", protected(http.HandlerFunc(h.GetMe)))
 	mux.Handle("GET /api/settings/clips", protected(http.HandlerFunc(h.GetClipSettings)))
 	mux.Handle("PUT /api/settings/clips", admin(http.HandlerFunc(h.PutClipSettings)))
+	// System health is an owner/admin diagnostic surface (storage, detector,
+	// versions, mqtt) — gated like the other admin settings routes.
+	mux.Handle("GET /api/system/health", admin(http.HandlerFunc(h.SystemHealth)))
 	// Per-user notification rules (label/zone/score/quiet-hours/cooldown). Each
 	// user manages only their own — no admin gate.
 	mux.Handle("GET /api/notification-rules", protected(http.HandlerFunc(h.GetNotificationRules)))
