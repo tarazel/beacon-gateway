@@ -3,6 +3,9 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -14,6 +17,7 @@ import (
 	"github.com/tarazel/beacon-gateway/internal/config"
 	"github.com/tarazel/beacon-gateway/internal/db"
 	"github.com/tarazel/beacon-gateway/internal/events"
+	"github.com/tarazel/beacon-gateway/internal/frigate"
 	"github.com/tarazel/beacon-gateway/internal/notifrules"
 )
 
@@ -36,6 +40,7 @@ func newTestHandlers(t *testing.T, cams []cameras.Camera) *Handlers {
 	}
 	return &Handlers{
 		cfg:        cfg,
+		log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		db:         d,
 		users:      auth.NewStore(d),
 		events:     events.NewStore(d),
@@ -72,6 +77,131 @@ func seedMember(t *testing.T, h *Handlers, id string, cameras ...string) {
 		}
 	}
 }
+
+// frigateStatsServer returns an httptest server that serves the given /api/stats
+// body, and a frigate client pointed at it.
+func frigateStatsServer(t *testing.T, statsBody string, status int) *frigate.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/stats" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(status)
+		io.WriteString(w, statsBody)
+	}))
+	t.Cleanup(srv.Close)
+	return frigate.NewClient(config.Frigate{BaseURL: srv.URL})
+}
+
+func TestSystemHealthAggregates(t *testing.T) {
+	h := newTestHandlers(t, []cameras.Camera{
+		{ID: "deimos", DisplayName: "Deimos", Stream: "deimos_sub"},
+		{ID: "doorbell", DisplayName: "Doorbell", Stream: "doorbell_sub"},
+	})
+	h.frigate = frigateStatsServer(t, `{
+		"cameras": {
+			"deimos":   {"camera_fps": 20.0, "detection_fps": 5.0, "process_fps": 5.0, "skipped_fps": 0.0},
+			"doorbell": {"camera_fps": 15.0, "detection_fps": 5.0, "process_fps": 5.0}
+		},
+		"detectors": {"coral": {"inference_speed": 8.35}},
+		"detection_fps": 10.0,
+		"service": {"version": "0.14.1-abc", "uptime": 3600,
+			"storage": {"/media/frigate/recordings": {"free": 100000, "total": 500000, "used": 400000, "mount_type": "ext4"}}}
+	}`, http.StatusOK)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/system/health", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), "user-1"))
+	w := httptest.NewRecorder()
+	h.SystemHealth(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var resp systemHealthResp
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+
+	if !resp.Frigate.Reachable {
+		t.Error("expected frigate reachable")
+	}
+	if resp.Frigate.Version != "0.14.1-abc" {
+		t.Errorf("version %q", resp.Frigate.Version)
+	}
+	if resp.Frigate.UptimeSeconds != 3600 {
+		t.Errorf("frigate uptime %d", resp.Frigate.UptimeSeconds)
+	}
+	if len(resp.Frigate.Detectors) != 1 || resp.Frigate.Detectors[0].Name != "coral" ||
+		resp.Frigate.Detectors[0].InferenceSpeedMs != 8.35 {
+		t.Errorf("detectors %+v", resp.Frigate.Detectors)
+	}
+	if len(resp.Frigate.Storage) != 1 {
+		t.Fatalf("storage %+v", resp.Frigate.Storage)
+	}
+	// 400000 MB used of 500000 → 80.0%; 400000/1024 ≈ 390.6 GB.
+	if resp.Frigate.Storage[0].UsedPct != 80.0 {
+		t.Errorf("used_pct %v", resp.Frigate.Storage[0].UsedPct)
+	}
+	if math.Abs(resp.Frigate.Storage[0].UsedGB-390.6) > 0.05 {
+		t.Errorf("used_gb %v", resp.Frigate.Storage[0].UsedGB)
+	}
+
+	if len(resp.Cameras) != 2 {
+		t.Fatalf("cameras %+v", resp.Cameras)
+	}
+	var deimos *cameraHealthResp
+	for i := range resp.Cameras {
+		if resp.Cameras[i].ID == "deimos" {
+			deimos = &resp.Cameras[i]
+		}
+	}
+	if deimos == nil || deimos.CameraFPS != 20.0 || deimos.DisplayName != "Deimos" {
+		t.Errorf("deimos row %+v", deimos)
+	}
+
+	// No relay configured + nil mqtt status in the test harness.
+	if resp.Gateway.Push.Transport != "disabled" {
+		t.Errorf("push transport %q", resp.Gateway.Push.Transport)
+	}
+	if resp.Gateway.MQTTConnected {
+		t.Error("expected mqtt not connected (nil status)")
+	}
+}
+
+func TestSystemHealthDegradesWhenFrigateDown(t *testing.T) {
+	h := newTestHandlers(t, []cameras.Camera{
+		{ID: "deimos", DisplayName: "Deimos", Stream: "deimos_sub"},
+	})
+	h.frigate = frigateStatsServer(t, "upstream boom", http.StatusInternalServerError)
+	h.cameraHealth = stubHealth{offline: map[string]bool{"deimos": true}}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/system/health", nil)
+	req = req.WithContext(auth.WithUser(req.Context(), "user-1"))
+	w := httptest.NewRecorder()
+	h.SystemHealth(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", w.Code, w.Body.String())
+	}
+	var resp systemHealthResp
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resp.Frigate.Reachable {
+		t.Error("expected frigate unreachable")
+	}
+	// The point of a health view: cameras still render (offline from the monitor)
+	// even when Frigate stats are gone.
+	if len(resp.Cameras) != 1 || !resp.Cameras[0].Offline || resp.Cameras[0].CameraFPS != 0 {
+		t.Errorf("cameras degraded row %+v", resp.Cameras)
+	}
+}
+
+// stubHealth is a CameraHealth returning canned offline state.
+type stubHealth struct{ offline map[string]bool }
+
+func (s stubHealth) Offline(id string) bool { return s.offline[id] }
 
 func TestCameraLiveReturnsDescriptor(t *testing.T) {
 	h := newTestHandlers(t, []cameras.Camera{
