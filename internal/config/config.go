@@ -166,7 +166,7 @@ func Load() (*Config, error) {
 			ReconnectWait: 5 * time.Second,
 		},
 		Frigate: Frigate{
-			BaseURL:              getEnv("FRIGATE_BASE_URL", "https://frigate.hydak.org"),
+			BaseURL:              getEnv("FRIGATE_BASE_URL", "http://frigate:5000"),
 			CFAccessClientID:     os.Getenv("CF_ACCESS_CLIENT_ID"),
 			CFAccessClientSecret: os.Getenv("CF_ACCESS_CLIENT_SECRET"),
 		},
