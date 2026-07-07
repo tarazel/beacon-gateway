@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"net/url"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -765,6 +766,89 @@ func (h *Handlers) ListEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"events": list})
+}
+
+// SearchEvents runs a natural-language semantic search over events (Frigate's
+// CLIP embeddings) and returns matching events in relevance order, scoped to the
+// caller's accessible cameras. Frigate owns the embeddings, so this proxies the
+// ranked ids to Frigate and hydrates them from the local store — giving search
+// results the exact shape and openability (detail/snapshot/clip all read the
+// local store) of the normal events list. Hits the gateway never mirrored are
+// dropped. Returns 501 when the Frigate instance has semantic search disabled.
+func (h *Handlers) SearchEvents(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "auth required")
+		return
+	}
+	query := strings.TrimSpace(r.URL.Query().Get("query"))
+	if query == "" {
+		writeError(w, http.StatusBadRequest, "query required")
+		return
+	}
+	limit := 50
+	if l := r.URL.Query().Get("limit"); l != "" {
+		if n, err := strconv.Atoi(l); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if limit > 100 {
+		limit = 100
+	}
+
+	allowed, all, err := h.users.AccessibleCameras(r.Context(), userID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "access check failed")
+		return
+	}
+	// Scope the search itself to the caller's cameras when they don't see all, so
+	// a scoped member never even embeds a query against cameras they can't view.
+	var scope []string
+	if !all {
+		if len(allowed) == 0 {
+			writeJSON(w, http.StatusOK, map[string]any{"events": []events.Event{}})
+			return
+		}
+		scope = allowed
+	}
+
+	// Frigate embeds the query text on demand; bound the wait independently of a
+	// slow client connection.
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	hits, err := h.frigate.SearchEvents(ctx, query, limit, scope)
+	if err != nil {
+		if errors.Is(err, frigate.ErrSearchNotEnabled) {
+			writeError(w, http.StatusNotImplemented, "semantic search is not enabled on this Frigate instance")
+			return
+		}
+		h.log.Error("event search failed", "err", err)
+		writeError(w, http.StatusBadGateway, "search failed")
+		return
+	}
+
+	// Defense in depth: even having passed the scope to Frigate, drop any hit
+	// outside the caller's accessible set before hydrating.
+	ids := make([]string, 0, len(hits))
+	for _, hit := range hits {
+		if all || slices.Contains(allowed, hit.Camera) {
+			ids = append(ids, hit.ID)
+		}
+	}
+	byID, err := h.events.GetByIDs(r.Context(), ids)
+	if err != nil {
+		h.log.Error("search hydrate failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "search failed")
+		return
+	}
+	// Preserve Frigate's relevance order; drop ids the gateway hasn't mirrored.
+	out := make([]events.Event, 0, len(ids))
+	for _, id := range ids {
+		if ev, ok := byID[id]; ok {
+			out = append(out, ev)
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"events": out})
 }
 
 func (h *Handlers) GetEvent(w http.ResponseWriter, r *http.Request) {

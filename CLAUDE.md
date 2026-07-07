@@ -103,6 +103,7 @@ POST   /api/invites                    # ADMIN: { role?, cameras?[], note?, expi
 GET    /api/invites                    # ADMIN: list invites
 DELETE /api/invites/{code}             # ADMIN: revoke an invite
 GET    /api/events                     # ?camera=&label=&since=&limit= (scoped to caller's cameras)
+GET    /api/events/search              # ?query=&limit= — semantic (NL) search via Frigate CLIP embeddings; scope-filtered, relevance-ordered; 501 if Frigate semantic_search disabled
 GET    /api/events/{id}
 GET    /api/events/{id}/push           # { title, body, thread_id, has_snapshot } — MEDIA-scoped; NSE reads this to render a minimal relay push
 GET    /api/events/{id}/snapshot       # proxied JPEG with Range support

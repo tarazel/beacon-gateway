@@ -1,11 +1,14 @@
 package frigate
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +19,12 @@ import (
 
 	"github.com/tarazel/beacon-gateway/internal/config"
 )
+
+// ErrSearchNotEnabled is returned by SearchEvents when Frigate reports that
+// semantic search is disabled (config semantic_search.enabled=false). Handlers
+// map it to a 501 so the client can show a "not enabled" state rather than a
+// generic error — most self-hosters won't have the feature turned on.
+var ErrSearchNotEnabled = errors.New("semantic search not enabled")
 
 var forwardedRequestHeaders = []string{
 	"Range",
@@ -220,6 +229,59 @@ func (c *Client) Stats(ctx context.Context) (*Stats, error) {
 		return nil, fmt.Errorf("frigate stats decode: %w", err)
 	}
 	return &stats, nil
+}
+
+// SearchResult is the subset of a Frigate semantic-search hit the gateway needs:
+// the event id (to hydrate the full event from the local store) and its camera
+// (to enforce the caller's per-camera scope). Frigate returns hits in relevance
+// order; the gateway preserves that order.
+type SearchResult struct {
+	ID     string `json:"id"`
+	Camera string `json:"camera"`
+}
+
+// SearchEvents runs a natural-language semantic search against Frigate's
+// /api/events/search (CLIP embeddings) and returns matching event ids in
+// relevance order. cams, when non-empty, scopes the search to those camera ids
+// (Frigate's `cameras` filter) so a scoped member never even embeds against
+// cameras they can't see. Returns ErrSearchNotEnabled when the Frigate instance
+// has semantic search disabled. Uses the caller's context for cancellation.
+func (c *Client) SearchEvents(ctx context.Context, query string, limit int, cams []string) ([]SearchResult, error) {
+	q := url.Values{}
+	q.Set("query", query)
+	q.Set("limit", strconv.Itoa(limit))
+	if len(cams) > 0 {
+		q.Set("cameras", strings.Join(cams, ","))
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.cfg.BaseURL+"/api/events/search?"+q.Encode(), nil)
+	if err != nil {
+		return nil, err
+	}
+	c.applyAuth(req)
+
+	resp, err := c.streaming.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("frigate search: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	if err != nil {
+		return nil, fmt.Errorf("frigate search read: %w", err)
+	}
+	// Frigate answers a disabled-feature request with 400 + a "not enabled"
+	// message; surface that as a typed error so the handler can 501 instead of 502.
+	if resp.StatusCode == http.StatusBadRequest && bytes.Contains(bytes.ToLower(body), []byte("not enabled")) {
+		return nil, ErrSearchNotEnabled
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("frigate search status %d", resp.StatusCode)
+	}
+	var results []SearchResult
+	if err := json.Unmarshal(body, &results); err != nil {
+		return nil, fmt.Errorf("frigate search decode: %w", err)
+	}
+	return results, nil
 }
 
 // ServeCachedClip serves event clip <id> with full HTTP Range support.
