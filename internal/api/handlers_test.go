@@ -94,6 +94,130 @@ func frigateStatsServer(t *testing.T, statsBody string, status int) *frigate.Cli
 	return frigate.NewClient(config.Frigate{BaseURL: srv.URL})
 }
 
+// frigateSearchServer returns a frigate client whose /api/events/search responds
+// with the given status+body, recording the `cameras` query param it received in
+// *gotCameras (so tests can assert scope was pushed down to Frigate).
+func frigateSearchServer(t *testing.T, body string, status int, gotCameras *string) *frigate.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/events/search" {
+			http.NotFound(w, r)
+			return
+		}
+		if gotCameras != nil {
+			*gotCameras = r.URL.Query().Get("cameras")
+		}
+		w.WriteHeader(status)
+		io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return frigate.NewClient(config.Frigate{BaseURL: srv.URL})
+}
+
+func decodeSearchIDs(t *testing.T, body io.Reader) []string {
+	t.Helper()
+	var resp struct {
+		Events []struct {
+			ID string `json:"id"`
+		} `json:"events"`
+	}
+	if err := json.NewDecoder(body).Decode(&resp); err != nil {
+		t.Fatalf("decode search response: %v", err)
+	}
+	ids := make([]string, len(resp.Events))
+	for i, e := range resp.Events {
+		ids[i] = e.ID
+	}
+	return ids
+}
+
+func TestSearchEvents(t *testing.T) {
+	cams := []cameras.Camera{
+		{ID: "deimos", DisplayName: "Deimos", Stream: "deimos_sub"},
+		{ID: "doorbell", DisplayName: "Doorbell", Stream: "doorbell_sub"},
+	}
+
+	t.Run("admin: preserves relevance order, drops unmirrored hits", func(t *testing.T) {
+		h := newTestHandlers(t, cams)
+		seedEvent(t, h, "evt-b", "deimos", "person", true)
+		seedEvent(t, h, "evt-a", "doorbell", "car", true)
+		// Frigate ranks b, then a, then "evt-ghost" which the gateway never mirrored.
+		h.frigate = frigateSearchServer(t, `[
+			{"id":"evt-b","camera":"deimos"},
+			{"id":"evt-a","camera":"doorbell"},
+			{"id":"evt-ghost","camera":"deimos"}
+		]`, http.StatusOK, nil)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/events/search?query=someone+walking", nil)
+		req = req.WithContext(auth.WithUser(req.Context(), "user-1"))
+		w := httptest.NewRecorder()
+		h.SearchEvents(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (%s)", w.Code, w.Body.String())
+		}
+		if got := decodeSearchIDs(t, w.Body); len(got) != 2 || got[0] != "evt-b" || got[1] != "evt-a" {
+			t.Fatalf("ids = %v, want [evt-b evt-a] (ghost dropped, order preserved)", got)
+		}
+	})
+
+	t.Run("scoped member: scope pushed to Frigate + out-of-scope hit dropped", func(t *testing.T) {
+		h := newTestHandlers(t, cams)
+		seedMember(t, h, "member-1", "doorbell")
+		seedEvent(t, h, "evt-door", "doorbell", "person", true)
+		seedEvent(t, h, "evt-drive", "deimos", "car", true)
+		var gotCameras string
+		// Frigate (mis)returns a deimos hit too; the handler must still drop it.
+		h.frigate = frigateSearchServer(t, `[
+			{"id":"evt-drive","camera":"deimos"},
+			{"id":"evt-door","camera":"doorbell"}
+		]`, http.StatusOK, &gotCameras)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/events/search?query=car", nil)
+		req = req.WithContext(auth.WithUser(req.Context(), "member-1"))
+		w := httptest.NewRecorder()
+		h.SearchEvents(w, req)
+
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (%s)", w.Code, w.Body.String())
+		}
+		if gotCameras != "doorbell" {
+			t.Errorf("cameras pushed to Frigate = %q, want doorbell", gotCameras)
+		}
+		if got := decodeSearchIDs(t, w.Body); len(got) != 1 || got[0] != "evt-door" {
+			t.Fatalf("ids = %v, want [evt-door] (deimos hit dropped)", got)
+		}
+	})
+
+	t.Run("disabled feature returns 501", func(t *testing.T) {
+		h := newTestHandlers(t, cams)
+		h.frigate = frigateSearchServer(t, `{"success":false,"message":"Semantic search is not enabled"}`, http.StatusBadRequest, nil)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/events/search?query=x", nil)
+		req = req.WithContext(auth.WithUser(req.Context(), "user-1"))
+		w := httptest.NewRecorder()
+		h.SearchEvents(w, req)
+
+		if w.Code != http.StatusNotImplemented {
+			t.Fatalf("status = %d, want 501", w.Code)
+		}
+	})
+
+	t.Run("empty query returns 400 without touching Frigate", func(t *testing.T) {
+		h := newTestHandlers(t, cams)
+		h.frigate = frigateSearchServer(t, `boom`, http.StatusInternalServerError, nil)
+
+		req := httptest.NewRequest(http.MethodGet, "/api/events/search?query=+", nil)
+		req = req.WithContext(auth.WithUser(req.Context(), "user-1"))
+		w := httptest.NewRecorder()
+		h.SearchEvents(w, req)
+
+		if w.Code != http.StatusBadRequest {
+			t.Fatalf("status = %d, want 400", w.Code)
+		}
+	})
+}
+
 func TestSystemHealthAggregates(t *testing.T) {
 	h := newTestHandlers(t, []cameras.Camera{
 		{ID: "deimos", DisplayName: "Deimos", Stream: "deimos_sub"},

@@ -45,6 +45,8 @@ func NewRouter(h *Handlers, jwtIssuer *auth.JWTIssuer, store *auth.Store, log *s
 	mux.Handle("GET /api/invites", admin(http.HandlerFunc(h.ListInvites)))
 	mux.Handle("DELETE /api/invites/{code}", admin(http.HandlerFunc(h.DeleteInvite)))
 	mux.Handle("GET /api/events", protected(http.HandlerFunc(h.ListEvents)))
+	// Literal /search takes precedence over the {id} wildcard in Go 1.22+ routing.
+	mux.Handle("GET /api/events/search", protected(http.HandlerFunc(h.SearchEvents)))
 	mux.Handle("GET /api/events/{id}", protected(http.HandlerFunc(h.GetEvent)))
 	// Media-scoped: the NSE reads this (with the media token) to render a banner
 	// from a privacy-minimal relay push, which carries only event_id.

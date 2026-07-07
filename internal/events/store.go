@@ -104,6 +104,45 @@ func (s *Store) Upsert(ctx context.Context, ev *frigate.MQTTEvent, raw []byte) (
 	return ev.Type == frigate.PhaseNew && rows == 1, nil
 }
 
+// eventColumns is the shared SELECT list for the events table, kept in one place
+// so List, Get, and GetByIDs stay in lockstep with scanEvent's column order.
+const eventColumns = `id, camera, label, sub_label, start_time, end_time, top_score, has_snapshot, has_clip, keep_clip, zones, created_at, updated_at`
+
+// scanRow is satisfied by both *sql.Row and *sql.Rows, so scanEvent works for
+// single-row and multi-row queries.
+type scanRow interface {
+	Scan(dest ...any) error
+}
+
+// scanEvent reads one events row (columns in eventColumns order) into an Event.
+func scanEvent(sc scanRow) (Event, error) {
+	var e Event
+	var subLabel sql.NullString
+	var endTime sql.NullInt64
+	var startUnix, createdUnix, updatedUnix int64
+	var hasSnap, hasClip, keepClip int
+	var zonesJSON string
+	if err := sc.Scan(&e.ID, &e.Camera, &e.Label, &subLabel, &startUnix, &endTime, &e.TopScore, &hasSnap, &hasClip, &keepClip, &zonesJSON, &createdUnix, &updatedUnix); err != nil {
+		return e, err
+	}
+	if subLabel.Valid {
+		v := subLabel.String
+		e.SubLabel = &v
+	}
+	e.StartTime = time.Unix(startUnix, 0)
+	if endTime.Valid {
+		t := time.Unix(endTime.Int64, 0)
+		e.EndTime = &t
+	}
+	e.HasSnapshot = hasSnap == 1
+	e.HasClip = hasClip == 1
+	e.KeepClip = keepClip == 1
+	_ = json.Unmarshal([]byte(zonesJSON), &e.Zones)
+	e.CreatedAt = time.Unix(createdUnix, 0)
+	e.UpdatedAt = time.Unix(updatedUnix, 0)
+	return e, nil
+}
+
 type ListFilter struct {
 	Camera string
 	Label  string
@@ -116,7 +155,7 @@ type ListFilter struct {
 }
 
 func (s *Store) List(ctx context.Context, f ListFilter) ([]Event, error) {
-	q := `SELECT id, camera, label, sub_label, start_time, end_time, top_score, has_snapshot, has_clip, keep_clip, zones, created_at, updated_at FROM events WHERE 1=1`
+	q := `SELECT ` + eventColumns + ` FROM events WHERE 1=1`
 	args := []any{}
 	if f.Camera != "" {
 		q += " AND camera = ?"
@@ -155,64 +194,53 @@ func (s *Store) List(ctx context.Context, f ListFilter) ([]Event, error) {
 
 	out := []Event{} // non-nil so an empty result marshals as [] not null
 	for rows.Next() {
-		var e Event
-		var subLabel sql.NullString
-		var endTime sql.NullInt64
-		var startUnix, createdUnix, updatedUnix int64
-		var hasSnap, hasClip, keepClip int
-		var zonesJSON string
-		if err := rows.Scan(&e.ID, &e.Camera, &e.Label, &subLabel, &startUnix, &endTime, &e.TopScore, &hasSnap, &hasClip, &keepClip, &zonesJSON, &createdUnix, &updatedUnix); err != nil {
+		e, err := scanEvent(rows)
+		if err != nil {
 			return nil, err
 		}
-		if subLabel.Valid {
-			s := subLabel.String
-			e.SubLabel = &s
-		}
-		e.StartTime = time.Unix(startUnix, 0)
-		if endTime.Valid {
-			t := time.Unix(endTime.Int64, 0)
-			e.EndTime = &t
-		}
-		e.HasSnapshot = hasSnap == 1
-		e.HasClip = hasClip == 1
-		e.KeepClip = keepClip == 1
-		_ = json.Unmarshal([]byte(zonesJSON), &e.Zones)
-		e.CreatedAt = time.Unix(createdUnix, 0)
-		e.UpdatedAt = time.Unix(updatedUnix, 0)
 		out = append(out, e)
 	}
 	return out, rows.Err()
 }
 
+// GetByIDs returns the events with the given ids keyed by id. Missing ids are
+// simply absent from the map (e.g. a Frigate semantic-search hit for an event
+// the gateway never mirrored). The caller preserves relevance/order; this only
+// hydrates. No camera-scope filtering here — callers do that before/after.
+func (s *Store) GetByIDs(ctx context.Context, ids []string) (map[string]Event, error) {
+	out := make(map[string]Event, len(ids))
+	if len(ids) == 0 {
+		return out, nil
+	}
+	q := `SELECT ` + eventColumns + ` FROM events WHERE id IN (` + placeholders(len(ids)) + `)`
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	rows, err := s.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		e, err := scanEvent(rows)
+		if err != nil {
+			return nil, err
+		}
+		out[e.ID] = e
+	}
+	return out, rows.Err()
+}
+
 func (s *Store) Get(ctx context.Context, id string) (*Event, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, camera, label, sub_label, start_time, end_time, top_score, has_snapshot, has_clip, keep_clip, zones, created_at, updated_at FROM events WHERE id = ?`, id)
-	var e Event
-	var subLabel sql.NullString
-	var endTime sql.NullInt64
-	var startUnix, createdUnix, updatedUnix int64
-	var hasSnap, hasClip, keepClip int
-	var zonesJSON string
-	if err := row.Scan(&e.ID, &e.Camera, &e.Label, &subLabel, &startUnix, &endTime, &e.TopScore, &hasSnap, &hasClip, &keepClip, &zonesJSON, &createdUnix, &updatedUnix); err != nil {
+	row := s.db.QueryRowContext(ctx, `SELECT `+eventColumns+` FROM events WHERE id = ?`, id)
+	e, err := scanEvent(row)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	if subLabel.Valid {
-		s := subLabel.String
-		e.SubLabel = &s
-	}
-	e.StartTime = time.Unix(startUnix, 0)
-	if endTime.Valid {
-		t := time.Unix(endTime.Int64, 0)
-		e.EndTime = &t
-	}
-	e.HasSnapshot = hasSnap == 1
-	e.HasClip = hasClip == 1
-	e.KeepClip = keepClip == 1
-	_ = json.Unmarshal([]byte(zonesJSON), &e.Zones)
-	e.CreatedAt = time.Unix(createdUnix, 0)
-	e.UpdatedAt = time.Unix(updatedUnix, 0)
 	return &e, nil
 }
 

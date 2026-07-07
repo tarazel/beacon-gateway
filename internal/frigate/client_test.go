@@ -2,6 +2,7 @@ package frigate
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +14,94 @@ import (
 
 	"github.com/tarazel/beacon-gateway/internal/config"
 )
+
+func TestSearchEvents(t *testing.T) {
+	t.Run("success forwards params and preserves order", func(t *testing.T) {
+		var gotQuery, gotLimit, gotCameras, gotPath string
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotPath = r.URL.Path
+			gotQuery = r.URL.Query().Get("query")
+			gotLimit = r.URL.Query().Get("limit")
+			gotCameras = r.URL.Query().Get("cameras")
+			w.Header().Set("Content-Type", "application/json")
+			// Extra fields (search_distance, data, …) must be ignored by the decoder.
+			io.WriteString(w, `[
+				{"id":"b","camera":"deimos","label":"person","search_distance":0.71},
+				{"id":"a","camera":"doorbell","label":"car","search_distance":0.83}
+			]`)
+		}))
+		defer upstream.Close()
+
+		c := NewClient(config.Frigate{BaseURL: upstream.URL})
+		res, err := c.SearchEvents(context.Background(), "person at the door", 5, []string{"deimos", "doorbell"})
+		if err != nil {
+			t.Fatalf("SearchEvents: %v", err)
+		}
+		if gotPath != "/api/events/search" {
+			t.Errorf("path = %q, want /api/events/search", gotPath)
+		}
+		if gotQuery != "person at the door" {
+			t.Errorf("query = %q", gotQuery)
+		}
+		if gotLimit != "5" {
+			t.Errorf("limit = %q, want 5", gotLimit)
+		}
+		if gotCameras != "deimos,doorbell" {
+			t.Errorf("cameras = %q, want deimos,doorbell", gotCameras)
+		}
+		if len(res) != 2 || res[0].ID != "b" || res[1].ID != "a" {
+			t.Fatalf("results not decoded in relevance order: %+v", res)
+		}
+		if res[0].Camera != "deimos" {
+			t.Errorf("camera = %q, want deimos", res[0].Camera)
+		}
+	})
+
+	t.Run("omits cameras param when scope empty", func(t *testing.T) {
+		var hadCameras bool
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, hadCameras = r.URL.Query()["cameras"]
+			io.WriteString(w, `[]`)
+		}))
+		defer upstream.Close()
+
+		c := NewClient(config.Frigate{BaseURL: upstream.URL})
+		if _, err := c.SearchEvents(context.Background(), "x", 5, nil); err != nil {
+			t.Fatalf("SearchEvents: %v", err)
+		}
+		if hadCameras {
+			t.Error("cameras param should be absent when scope is empty (admin/all)")
+		}
+	})
+
+	t.Run("disabled feature maps to ErrSearchNotEnabled", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w, `{"success":false,"message":"Semantic search is not enabled"}`)
+		}))
+		defer upstream.Close()
+
+		c := NewClient(config.Frigate{BaseURL: upstream.URL})
+		_, err := c.SearchEvents(context.Background(), "x", 5, nil)
+		if !errors.Is(err, ErrSearchNotEnabled) {
+			t.Fatalf("expected ErrSearchNotEnabled, got %v", err)
+		}
+	})
+
+	t.Run("other error status surfaces as error", func(t *testing.T) {
+		upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+		}))
+		defer upstream.Close()
+
+		c := NewClient(config.Frigate{BaseURL: upstream.URL})
+		if _, err := c.SearchEvents(context.Background(), "x", 5, nil); err == nil {
+			t.Fatal("expected an error on 500")
+		} else if errors.Is(err, ErrSearchNotEnabled) {
+			t.Fatal("500 should not be treated as not-enabled")
+		}
+	})
+}
 
 func TestProxyForwardsRangeAndCFHeaders(t *testing.T) {
 	var gotRange, gotCFID, gotCFSecret string
