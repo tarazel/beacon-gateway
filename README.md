@@ -55,6 +55,23 @@ the relay service itself is a separate component.
 - For push + Sign in with Apple: an **Apple Developer account** (for an APNs key,
   or to ship/sideload your own iOS client build under your own bundle ID).
 
+## Push out of the box: the Beacon Pro relay
+
+`RELAY_URL` defaults to Tarazel's hosted relay (`relay.tarazel.com`), so push
+works with **zero setup**: your first admin sign-in registers the gateway
+using that user's verified Apple/Google identity (no secret to paste), starts
+a trial, and notifications just work. After the trial, keeping it active is a
+small [Beacon Pro](https://tarazel.com) subscription — it entitles your whole
+household, not per device, and it's the one piece of this that Tarazel hosts
+rather than you.
+
+Don't want any third party — even a privacy-minimal one — in the push path?
+Set `RELAY_URL=off` and configure your own Apple `.p8` key (`APNS_*` below);
+the gateway then pushes directly to APNs. That needs an Apple Developer
+account, and, for push to reach the *published* apps, a rebuild under your own
+bundle ID. Either way, see [Privacy](#privacy) for exactly what the relay does
+and doesn't see.
+
 ## Quick start
 
 ```bash
@@ -117,6 +134,24 @@ All user-facing playback (live view, anything browser-reachable) must use the
 HEVC, so clip playback can serve Frigate's H.265 recording — but live view and
 anything a browser could reach must be H.264. `CAMERAS_JSON.stream` must point at
 the H.264 substream.
+
+## Privacy
+
+The gateway is built so nobody but you has to see your footage or metadata:
+
+- **Frigate stays the only place your camera data lives.** Events, snapshots,
+  and clips are read from your own Frigate and proxied straight to your
+  family's devices; the gateway's local cache never uploads anything upstream.
+- **All PII lives in your own SQLite database** — accounts, per-camera scope,
+  mute state, and notification rules never leave your instance.
+- **The hosted relay is privacy-minimal by design, not just by policy.** It
+  only ever sees an opaque `event_id` and device push tokens — never camera
+  names, labels, or images. The real title/body/snapshot are fetched by each
+  phone directly from *your* gateway (see the notification service extension /
+  `internal/relayclient`), so the relay has nothing worth leaking even if it
+  were compromised.
+- **Run your own APNs key (`RELAY_URL=off`) and there's no third party in the
+  push path at all** — `DirectTransport` talks to Apple directly.
 
 ## Status & limitations
 
