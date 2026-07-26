@@ -80,6 +80,15 @@ make build                 # builds the gateway + beacon-admin CLI
 make docker                # or: docker compose up -d --build
 ```
 
+No Go toolchain, or don't want to build from source? Every tagged release
+publishes multi-arch (`linux/amd64` + `linux/arm64`) images to GHCR — swap
+`build: .` in `docker-compose.yml` for an `image:` line and skip straight to
+running it:
+
+```yaml
+image: ghcr.io/tarazel/beacon-gateway:v1.0.0   # or :latest — see Releases for tags
+```
+
 Minimum config to edit in `.env`:
 
 - `FRIGATE_BASE_URL` — internal address is simplest (`http://frigate:5000`).
