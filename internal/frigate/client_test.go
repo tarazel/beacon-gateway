@@ -9,6 +9,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -230,39 +232,101 @@ func TestEnsureCachedClip_FastPathSkipsFetch(t *testing.T) {
 	}
 }
 
-// TestLockClip_SerializesSameID confirms the per-id lock is mutually exclusive
-// for one id but independent across ids — the guarantee that keeps a pre-warm
-// from racing a user tap on the same clip.
-func TestLockClip_SerializesSameID(t *testing.T) {
-	c := NewClient(config.Frigate{})
+// TestEnsureCachedClip_SurvivesCallerCancellation is the regression test for
+// clips failing to load on cellular: the download+remux job used to run on the
+// requesting client's own r.Context(), so a dropped cellular connection (tower
+// handoff, brief signal loss, backgrounding — routine on cellular, rare on a
+// stable WiFi connection) cancelled it mid-flight, deleting the partial work.
+// A retry then restarted the whole expensive job from zero, sometimes looping
+// forever on flaky cellular. This verifies a cancelled caller (a) returns
+// promptly instead of blocking, and (b) does NOT abort the underlying fetch —
+// a second caller for the same id shares the one job already in flight rather
+// than triggering a brand new upstream fetch.
+func TestEnsureCachedClip_SurvivesCallerCancellation(t *testing.T) {
+	var fetches int32
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fetches, 1)
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "partial-clip-bytes")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release // hold the response open to keep the download in flight
+	}))
+	defer upstream.Close()
 
-	unlock := c.lockClip("a")
-	acquired := make(chan struct{})
+	c := NewClient(config.Frigate{BaseURL: upstream.URL})
+	dir := t.TempDir()
+
+	// Simulate a caller whose connection has already dropped (cellular hiccup).
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	start := time.Now()
+	_, err := c.EnsureCachedClip(cancelledCtx, "evt1", dir)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled for a pre-cancelled caller, got %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("EnsureCachedClip blocked %v on a cancelled caller instead of returning promptly", elapsed)
+	}
+
+	// A second, fresh-context caller joins the job the first (now-abandoned)
+	// caller kicked off, while it's still held open upstream.
+	secondDone := make(chan struct{})
 	go func() {
-		u2 := c.lockClip("a") // must block until unlock() below
-		close(acquired)
-		u2()
+		c.EnsureCachedClip(context.Background(), "evt1", dir) // errors post-download (no ffmpeg in test env); irrelevant here
+		close(secondDone)
 	}()
+	time.Sleep(150 * time.Millisecond) // let the second caller join before we let the job finish
+	close(release)
+
 	select {
-	case <-acquired:
-		t.Fatal("second lock on same id acquired while first was held")
-	case <-time.After(50 * time.Millisecond):
-	}
-	unlock()
-	select {
-	case <-acquired:
-	case <-time.After(time.Second):
-		t.Fatal("second lock never acquired after release")
+	case <-secondDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("second caller never completed")
 	}
 
-	// A different id is not blocked by a held lock.
-	held := c.lockClip("b")
-	done := make(chan struct{})
-	go func() { u := c.lockClip("c"); u(); close(done) }()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("lock on a different id should not block")
+	if got := atomic.LoadInt32(&fetches); got != 1 {
+		t.Errorf("expected exactly 1 upstream fetch (job shared via singleflight, not restarted after cancellation), got %d", got)
 	}
-	held()
+}
+
+// TestEnsureCachedClip_DedupsConcurrentCallers confirms concurrent callers for
+// the same id share a single upstream fetch — the guarantee that keeps a
+// pre-warm from racing a user tap on the same clip — while different ids still
+// fetch independently.
+func TestEnsureCachedClip_DedupsConcurrentCallers(t *testing.T) {
+	var fetches int32
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&fetches, 1)
+		w.WriteHeader(http.StatusOK)
+		io.WriteString(w, "partial-clip-bytes")
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+		<-release
+	}))
+	defer upstream.Close()
+
+	c := NewClient(config.Frigate{BaseURL: upstream.URL})
+	dir := t.TempDir()
+
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c.EnsureCachedClip(context.Background(), "evt-shared", dir) // errors post-download (no ffmpeg in test env); irrelevant here
+		}()
+	}
+	time.Sleep(150 * time.Millisecond) // let all three join the same in-flight job
+	close(release)
+	wg.Wait()
+
+	if got := atomic.LoadInt32(&fetches); got != 1 {
+		t.Errorf("expected exactly 1 upstream fetch for 3 concurrent callers of the same id, got %d", got)
+	}
 }
