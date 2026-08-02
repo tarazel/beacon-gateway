@@ -2,22 +2,33 @@ name: Auto Release
 
 # Every merge to main cuts a release: bump the patch version, push the tag,
 # build+push the multi-arch image, and create the GitHub release — no manual
-# tagging step. Override the bump by putting one of the bracket tags below
-# anywhere in the merge commit message; skip the release entirely with
-# [skip release].
+# tagging step. Override the bump by putting one of the tags below anywhere
+# in the merge commit message; skip the release entirely with [skip release]
+# (that one's a literal-substring `contains()` check in this file's own `if:`
+# below, not the tag-bump action's matcher, so it's unaffected by the two
+# gotchas documented here).
 #
-#   [release:major]   [release:minor]   [release:patch]   [release:none]
+#   bump:major   bump:minor   bump:patch   bump:none
 #
-# These are deliberately not the tag-bump action's own defaults (#major /
-# #minor / #patch) — a PR merged 2026-08-02 that *documented* the default
-# tokens in its own commit message got parsed as an instruction by the very
-# mechanism it was describing, self-triggering an unintended major bump
-# (v1.0.0 -> v2.0.0, corrected by hand to v1.1.0). Bracket tags are far less
-# likely to appear by accident in ordinary commit prose. BRANCH_HISTORY=last
-# (below) narrows the token scan to just the one commit being pushed, instead
-# of every commit since the last tag — the same incident also happened partly
-# because the default "compare" mode scanned all the way back to the last
-# tag and picked up that token from an unrelated earlier commit in the range.
+# Two incidents on 2026-08-02, in order:
+#   1. The PR that first added this workflow described the tag-bump action's
+#      *default* tokens (#major / #minor) in its own commit message. The
+#      action scans commit messages since the last tag by default, read its
+#      own documentation as an instruction, and self-triggered an unintended
+#      major bump (v1.0.0 -> v2.0.0). Mitigated two ways: switched to
+#      distinct, non-default tokens, and set BRANCH_HISTORY=last (below) so
+#      only the one commit being pushed is scanned, not the full range since
+#      the last tag.
+#   2. The distinct tokens chosen were bracketed (`[release:major]` etc).
+#      The action matches tokens via a bash `case "$log" in *$token* )`
+#      pattern — a *glob* match, not literal substring or regex. Square
+#      brackets in a glob are a character class: `[release:major]` matched
+#      any single occurrence of any of the letters r/e/l/a/s/:/m/j/o, i.e.
+#      nearly any commit message, and self-triggered *another* unintended
+#      major bump on the very next merge (the PR fixing incident 1).
+#      Current tokens avoid all glob/regex-special characters
+#      (`* ? [ ] ( ) !`) for exactly this reason — verify locally with
+#      `case "$log" in *bump:major*) ... esac` before ever changing these.
 #
 # This does its own tag+build+release in one job rather than relying on the
 # tag push to trigger release.yml (the tag-triggered workflow), because a tag
@@ -50,10 +61,10 @@ jobs:
           WITH_V: true
           RELEASE_BRANCHES: main
           BRANCH_HISTORY: last
-          MAJOR_STRING_TOKEN: "[release:major]"
-          MINOR_STRING_TOKEN: "[release:minor]"
-          PATCH_STRING_TOKEN: "[release:patch]"
-          NONE_STRING_TOKEN: "[release:none]"
+          MAJOR_STRING_TOKEN: "bump:major"
+          MINOR_STRING_TOKEN: "bump:minor"
+          PATCH_STRING_TOKEN: "bump:patch"
+          NONE_STRING_TOKEN: "bump:none"
 
       - uses: docker/setup-qemu-action@v3
 
