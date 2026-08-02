@@ -2,8 +2,22 @@ name: Auto Release
 
 # Every merge to main cuts a release: bump the patch version, push the tag,
 # build+push the multi-arch image, and create the GitHub release — no manual
-# tagging step. Override the bump with #minor or #major anywhere in the merge
-# commit message; skip the release entirely with [skip release].
+# tagging step. Override the bump by putting one of the bracket tags below
+# anywhere in the merge commit message; skip the release entirely with
+# [skip release].
+#
+#   [release:major]   [release:minor]   [release:patch]   [release:none]
+#
+# These are deliberately not the tag-bump action's own defaults (#major /
+# #minor / #patch) — a PR merged 2026-08-02 that *documented* the default
+# tokens in its own commit message got parsed as an instruction by the very
+# mechanism it was describing, self-triggering an unintended major bump
+# (v1.0.0 -> v2.0.0, corrected by hand to v1.1.0). Bracket tags are far less
+# likely to appear by accident in ordinary commit prose. BRANCH_HISTORY=last
+# (below) narrows the token scan to just the one commit being pushed, instead
+# of every commit since the last tag — the same incident also happened partly
+# because the default "compare" mode scanned all the way back to the last
+# tag and picked up that token from an unrelated earlier commit in the range.
 #
 # This does its own tag+build+release in one job rather than relying on the
 # tag push to trigger release.yml (the tag-triggered workflow), because a tag
@@ -35,6 +49,11 @@ jobs:
           DEFAULT_BUMP: patch
           WITH_V: true
           RELEASE_BRANCHES: main
+          BRANCH_HISTORY: last
+          MAJOR_STRING_TOKEN: "[release:major]"
+          MINOR_STRING_TOKEN: "[release:minor]"
+          PATCH_STRING_TOKEN: "[release:patch]"
+          NONE_STRING_TOKEN: "[release:none]"
 
       - uses: docker/setup-qemu-action@v3
 
