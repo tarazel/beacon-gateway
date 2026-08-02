@@ -1,5 +1,9 @@
 name: Release
 
+# Manual escape hatch: push a tag by hand (e.g. to re-cut a release from an
+# older commit) and this builds+publishes it. Normal merges to main are
+# released automatically by auto-release.yml instead.
+
 on:
   push:
     tags:
