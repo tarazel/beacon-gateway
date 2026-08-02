@@ -14,10 +14,10 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/tarazel/beacon-gateway/internal/config"
+	"golang.org/x/sync/singleflight"
 )
 
 // ErrSearchNotEnabled is returned by SearchEvents when Frigate reports that
@@ -46,11 +46,12 @@ type Client struct {
 	cfg       config.Frigate
 	streaming *http.Client
 
-	// Per-event locks serialize concurrent clip caching for the same id (e.g. a
-	// background pre-warm racing a user tapping the push), so ffmpeg never runs
-	// twice against the same temp files. Different ids still cache concurrently.
-	clipMu    sync.Mutex
-	clipLocks map[string]*sync.Mutex
+	// clipGroup dedupes concurrent clip caching for the same id (e.g. a background
+	// pre-warm racing a user tapping the push), so ffmpeg never runs twice against
+	// the same temp files. Different ids still cache concurrently. The fetch itself
+	// runs on a detached context (see EnsureCachedClip) so a caller dropping out
+	// doesn't abort the fill for everyone else waiting on it.
+	clipGroup singleflight.Group
 }
 
 func NewClient(cfg config.Frigate) *Client {
@@ -62,23 +63,7 @@ func NewClient(cfg config.Frigate) *Client {
 				IdleConnTimeout:       90 * time.Second,
 			},
 		},
-		clipLocks: make(map[string]*sync.Mutex),
 	}
-}
-
-// lockClip acquires the per-id clip lock and returns a release func. Callers must
-// defer the returned func. The lock is kept in the map after release (bounded by
-// the number of distinct events cached this process lifetime — small).
-func (c *Client) lockClip(id string) func() {
-	c.clipMu.Lock()
-	m, ok := c.clipLocks[id]
-	if !ok {
-		m = &sync.Mutex{}
-		c.clipLocks[id] = m
-	}
-	c.clipMu.Unlock()
-	m.Lock()
-	return m.Unlock
 }
 
 // Proxy forwards a GET to Frigate, including Range and conditional headers,
@@ -302,23 +287,45 @@ func (c *Client) ServeCachedClip(w http.ResponseWriter, r *http.Request, id, cac
 // EnsureCachedClip downloads and remuxes event <id>'s clip into
 // <cacheDir>/<id>.mp4 if it isn't already cached, returning the cache path. Used
 // both by ServeCachedClip and to proactively cache a clip when it gets pinned.
+//
+// The download+remux runs on a context detached from the caller's ctx (see
+// clipCacheTimeout), not the caller's own. A caller whose ctx is cancelled first
+// (e.g. their HTTP client disconnected — routine on cellular: tower handoffs,
+// brief signal loss, backgrounding) just stops waiting; the fill keeps running in
+// the background so it, or any concurrent/retrying caller for the same id already
+// joined via clipGroup, can still finish it rather than restarting the expensive
+// download+ffmpeg remux from zero on every interrupted attempt.
 func (c *Client) EnsureCachedClip(ctx context.Context, id, cacheDir string) (string, error) {
 	cachePath := filepath.Join(cacheDir, id+".mp4")
-	// Fast path: already cached, no lock needed.
+	// Fast path: already cached, no dedup needed.
 	if info, err := os.Stat(cachePath); err == nil && info.Size() > 0 {
 		return cachePath, nil
 	}
-	// Serialize concurrent cachers of this id, then re-check: another caller may
-	// have finished the remux while we waited for the lock.
-	unlock := c.lockClip(id)
-	defer unlock()
-	if info, err := os.Stat(cachePath); err == nil && info.Size() > 0 {
+
+	resultCh := c.clipGroup.DoChan(id, func() (any, error) {
+		// Re-check: another caller may have finished the remux while we were
+		// dispatched but before we acquired dedup (or while a prior singleflight
+		// call for this id was still settling).
+		if info, err := os.Stat(cachePath); err == nil && info.Size() > 0 {
+			return cachePath, nil
+		}
+		jobCtx, cancel := context.WithTimeout(context.Background(), ClipCacheTimeout)
+		defer cancel()
+		if err := c.cacheClip(jobCtx, id, cacheDir, cachePath); err != nil {
+			return "", err
+		}
 		return cachePath, nil
+	})
+
+	select {
+	case res := <-resultCh:
+		if res.Err != nil {
+			return "", res.Err
+		}
+		return res.Val.(string), nil
+	case <-ctx.Done():
+		return "", ctx.Err()
 	}
-	if err := c.cacheClip(ctx, id, cacheDir, cachePath); err != nil {
-		return "", err
-	}
-	return cachePath, nil
 }
 
 func (c *Client) cacheClip(ctx context.Context, id, cacheDir, cachePath string) error {
@@ -422,6 +429,10 @@ func (c *Client) cacheClip(ctx context.Context, id, cacheDir, cachePath string) 
 }
 
 const (
+	// ClipCacheTimeout bounds the detached download+remux job started by
+	// EnsureCachedClip (and reused by callers that prewarm a clip ahead of any
+	// user request), independent of any one caller's own request lifetime.
+	ClipCacheTimeout = 5 * time.Minute
 	// corruptClipDurationThreshold: a real Frigate event clip is at most minutes;
 	// anything past this is the EXT-1 timestamp corruption (frames smeared across
 	// hundreds of hours), which triggers the rebuild-timestamps remux path. Set

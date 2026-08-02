@@ -170,7 +170,7 @@ func buildPushTransport(_ context.Context, cfg *config.Config, settingsStore *se
 // message context is short-lived, but a remux can take a while. Best-effort:
 // failures are logged, not surfaced (the clip still remuxes on demand later).
 func prewarmClip(log *slog.Logger, frig *frigate.Client, cfg *config.Config, id string) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(context.Background(), frigate.ClipCacheTimeout)
 	defer cancel()
 	if _, err := frig.EnsureCachedClip(ctx, id, cfg.ClipsDir()); err != nil {
 		log.Warn("clip prewarm failed", "event_id", id, "err", err)
