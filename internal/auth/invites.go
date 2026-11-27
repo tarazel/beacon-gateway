@@ -153,8 +153,16 @@ func (s *Store) DeleteInvite(ctx context.Context, code string) (bool, error) {
 // pending (unconsumed and unexpired). Returns false if it was already used,
 // expired, or unknown — enforcing single use even under a race.
 func (s *Store) ConsumeInvite(ctx context.Context, code, userID string) (bool, error) {
+	return consumeInvite(ctx, s.db, code, userID)
+}
+
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+func consumeInvite(ctx context.Context, db execer, code, userID string) (bool, error) {
 	now := time.Now()
-	res, err := s.db.ExecContext(ctx,
+	res, err := db.ExecContext(ctx,
 		`UPDATE invites SET consumed_by = ?, consumed_at = ?
 		 WHERE code = ? AND consumed_at IS NULL AND (expires_at IS NULL OR expires_at > ?)`,
 		userID, now.Unix(), code, now.Unix(),

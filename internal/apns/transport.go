@@ -290,11 +290,11 @@ func (r *RelayTransport) Deliver(ctx context.Context, platform, environment stri
 // RegisterWithRelay registers this gateway with the relay by forwarding the admin's
 // verified provider ID token (identity registration — no shared secret). The
 // returned InstanceToken is persisted by the caller and used for all later pushes.
-func RegisterWithRelay(ctx context.Context, baseURL, provider, idToken string, client *http.Client) (*relay.RegisterResponse, error) {
+func RegisterWithRelay(ctx context.Context, baseURL string, req relay.RegisterRequest, client *http.Client) (*relay.RegisterResponse, error) {
 	if client == nil {
 		client = &http.Client{Timeout: 15 * time.Second}
 	}
-	body, err := json.Marshal(relay.RegisterRequest{Provider: provider, IDToken: idToken})
+	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal relay register: %w", err)
 	}

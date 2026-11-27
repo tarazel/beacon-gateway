@@ -48,7 +48,11 @@ type PushResponse struct {
 type RegisterRequest struct {
 	Provider string `json:"provider"` // "apple" | "google"
 	IDToken  string `json:"id_token"`
-	Label    string `json:"label,omitempty"`
+	// NonceSecret and GatewayOrigin let the relay verify that the token was
+	// requested for the gateway doing the registering.
+	NonceSecret   string `json:"nonce_secret,omitempty"`
+	GatewayOrigin string `json:"gateway_origin,omitempty"`
+	Label         string `json:"label,omitempty"`
 }
 
 // RegisterResponse is returned once from POST /v1/register. instance_token is

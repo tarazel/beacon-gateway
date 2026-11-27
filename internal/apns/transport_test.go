@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"github.com/tarazel/beacon-gateway/internal/relayclient"
 )
 
 // newStubRelay stands in for the central relay's HTTP API so the gateway's relay
@@ -70,7 +71,7 @@ func TestRelayTransport_EndToEnd(t *testing.T) {
 	defer srv.Close()
 	ctx := context.Background()
 
-	reg, err := RegisterWithRelay(ctx, srv.URL, "apple", "good-id-token", srv.Client())
+	reg, err := RegisterWithRelay(ctx, srv.URL, relayclient.RegisterRequest{Provider: "apple", IDToken: "good-id-token"}, srv.Client())
 	if err != nil {
 		t.Fatalf("RegisterWithRelay: %v", err)
 	}
@@ -105,7 +106,7 @@ func TestRelayTransport_EndToEnd(t *testing.T) {
 func TestRegisterWithRelay_Rejected(t *testing.T) {
 	srv := newStubRelay(t, "rk_test")
 	defer srv.Close()
-	if _, err := RegisterWithRelay(context.Background(), srv.URL, "apple", "bad", srv.Client()); err == nil {
+	if _, err := RegisterWithRelay(context.Background(), srv.URL, relayclient.RegisterRequest{Provider: "apple", IDToken: "bad"}, srv.Client()); err == nil {
 		t.Fatal("expected error registering with a rejected id token")
 	}
 }

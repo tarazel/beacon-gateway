@@ -67,7 +67,7 @@ internal/
 ├── mqtt/           Frigate event subscriber (eclipse/paho.mqtt.golang)
 ├── relayclient/    wire-contract types for the push relay (KEEP IN SYNC w/ relay repo)
 └── settings/       key/value settings store
-Dockerfile          distroless static-debian12, nonroot user
+Dockerfile          Alpine, nonroot user, minimal ffmpeg built from source
 docker-compose.yml  deployment compose
 Makefile            build / test / docker targets
 .env.example        all configurable env vars with comments
@@ -86,6 +86,7 @@ POST   /api/auth/google                # Sign in with Google — id_token → JW
 POST   /api/auth/refresh               # refresh token → new JWT + refresh
 
 POST   /api/devices                    # register push device token { apns_token, platform?, app_version?, environment? } — platform "ios"(default)|"android"; environment "production"|"sandbox"
+DELETE /api/devices                    # { apns_token } — stop pushes to one of the caller's devices (apps call it on sign-out)
 GET    /api/me                         # { user_id, email, name, role, is_admin, all_cameras, cameras[] }
 GET    /api/mute                       # { muted_until, cameras:[{camera,muted_until}] }
 POST   /api/mute                       # { duration_seconds, camera? } — camera omitted = global; 0 clears
@@ -167,6 +168,15 @@ Three boundaries:
      (3) new user, gated by allowlist/invite. Only step 3 is gated. `users.apple_sub`
      is a legacy NOT NULL/UNIQUE anchor only (`google:<sub>` synthesized for
      Google-only users).
+   - **Gateway binding:** apps request each ID token with the nonce
+     `sha256("beacon-signin-v1\n" + origin + "\n" + secret)` and send `nonce_secret`
+     at sign-in; the gateway recomputes it with `PUBLIC_BASE_URL` (or an
+     `AUTH_ALLOWED_ORIGINS` entry), so a token captured elsewhere is useless here.
+     The formula is shared with both apps and the relay. `REQUIRE_SIGNIN_NONCE`
+     (default `true`) rejects apps that don't send it.
+   - **Revocation:** `auth.Middleware` and its variants check on every request that
+     the account exists and isn't disabled, so `beacon-admin revoke` and
+     `delete-user` take effect immediately.
 2. **Gateway → Frigate:** Optional Cloudflare Access service token (machine-to-
    machine). Set `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` to inject
    `CF-Access-Client-Id` / `CF-Access-Client-Secret` headers on every Frigate
@@ -182,12 +192,17 @@ A new sign-in (Apple *or* Google) is admitted if **either** the email is allowli
 returning user, or one linked to an existing account by verified email, is not
 re-gated.
 
+Only a provider-**verified** email counts for the allowlist, `ADMIN_EMAILS`,
+account linking, or being stored. `beacon-admin revoke <email>` blocks the email
+(even one listed in the env var), disables its accounts, and drops their tokens
+and devices; `allow` undoes it.
+
 Allowlist — two sources, unioned: the `APPLE_ALLOWED_EMAILS` env var (bootstrap)
 and the `allowed_emails` SQLite table (managed via `beacon-admin`). Invites
 (`invites` table) are the easier path: an admin mints a single-use code carrying
 a role + optional camera scope + expiry; the invitee enters it on the Sign In
-screen; redemption creates their account and consumes the code (single-use,
-enforced via a conditional UPDATE). Codes use an unambiguous alphabet, `XXXX-XXXX`.
+screen; redemption creates their account and consumes the code in one transaction
+(`CreateUserFromInvite`), so concurrent redemptions admit one person. Codes use an unambiguous alphabet, `XXXX-XXXX`.
 
 ---
 

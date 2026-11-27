@@ -26,6 +26,7 @@ import (
 	"github.com/tarazel/beacon-gateway/internal/frigate"
 	"github.com/tarazel/beacon-gateway/internal/go2rtc"
 	"github.com/tarazel/beacon-gateway/internal/notifrules"
+	"github.com/tarazel/beacon-gateway/internal/relayclient"
 	"github.com/tarazel/beacon-gateway/internal/settings"
 )
 
@@ -62,6 +63,7 @@ type Handlers struct {
 	startTime    time.Time
 	allowlist    map[string]struct{}
 	adminEmails  map[string]struct{}
+	nonce        auth.NoncePolicy
 }
 
 // cameraOffline reports whether the camera should be tagged offline, tolerating
@@ -114,7 +116,18 @@ func NewHandlers(
 		startTime:    time.Now(),
 		allowlist:    allow,
 		adminEmails:  admins,
+		nonce:        noncePolicy(cfg),
 	}
+}
+
+func noncePolicy(cfg *config.Config) auth.NoncePolicy {
+	p := auth.NoncePolicy{Required: cfg.Auth.RequireSignInNonce}
+	for _, raw := range append([]string{cfg.PublicBaseURL}, cfg.Auth.ExtraOrigins...) {
+		if origin, err := auth.CanonicalOrigin(raw); err == nil {
+			p.Origins = append(p.Origins, origin)
+		}
+	}
+	return p
 }
 
 func (h *Handlers) Healthz(w http.ResponseWriter, r *http.Request) {
@@ -123,8 +136,10 @@ func (h *Handlers) Healthz(w http.ResponseWriter, r *http.Request) {
 
 type appleSignInRequest struct {
 	IdentityToken string `json:"identity_token"`
-	Name          string `json:"name,omitempty"`
-	InviteCode    string `json:"invite_code,omitempty"`
+	// NonceSecret proves the token was requested for this gateway.
+	NonceSecret string `json:"nonce_secret,omitempty"`
+	Name        string `json:"name,omitempty"`
+	InviteCode  string `json:"invite_code,omitempty"`
 }
 
 type googleSignInRequest struct {
@@ -133,6 +148,7 @@ type googleSignInRequest struct {
 	// legacy identity_token alias is also accepted for symmetry with Apple.
 	IDToken       string `json:"id_token"`
 	IdentityToken string `json:"identity_token,omitempty"`
+	NonceSecret   string `json:"nonce_secret,omitempty"`
 	Name          string `json:"name,omitempty"`
 	InviteCode    string `json:"invite_code,omitempty"`
 }
@@ -181,6 +197,12 @@ func (h *Handlers) AppleSignIn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid apple token")
 		return
 	}
+	origin, err := h.nonce.Check(id.Nonce, req.NonceSecret)
+	if err != nil {
+		h.log.Warn("apple sign-in rejected", "err", err)
+		writeError(w, http.StatusUnauthorized, nonceRejectMsg)
+		return
+	}
 	h.completeProviderSignIn(w, r, providerSignIn{
 		provider:      auth.ProviderApple,
 		sub:           id.Sub,
@@ -190,6 +212,8 @@ func (h *Handlers) AppleSignIn(w http.ResponseWriter, r *http.Request) {
 		inviteCode:    req.InviteCode,
 		rejectMsg:     "this Apple ID is not authorized — ask the owner for an invite",
 		idToken:       req.IdentityToken,
+		nonceSecret:   req.NonceSecret,
+		origin:        origin,
 	})
 }
 
@@ -217,6 +241,12 @@ func (h *Handlers) GoogleSignIn(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid google token")
 		return
 	}
+	origin, err := h.nonce.Check(id.Nonce, req.NonceSecret)
+	if err != nil {
+		h.log.Warn("google sign-in rejected", "err", err)
+		writeError(w, http.StatusUnauthorized, nonceRejectMsg)
+		return
+	}
 	name := req.Name
 	if name == "" {
 		name = id.Name
@@ -230,8 +260,12 @@ func (h *Handlers) GoogleSignIn(w http.ResponseWriter, r *http.Request) {
 		inviteCode:    req.InviteCode,
 		rejectMsg:     "this Google account is not authorized — ask the owner for an invite",
 		idToken:       token,
+		nonceSecret:   req.NonceSecret,
+		origin:        origin,
 	})
 }
+
+const nonceRejectMsg = "sign-in could not be verified for this gateway — update the app and try again"
 
 type providerSignIn struct {
 	provider      string
@@ -245,6 +279,9 @@ type providerSignIn struct {
 	// push relay to claim this instance on the owner's first admin sign-in (see
 	// maybeRegisterRelayAtSignIn) — the account-based, secret-free registration.
 	idToken string
+	// nonceSecret and origin let the relay check the same binding the gateway did.
+	nonceSecret string
+	origin      string
 }
 
 // completeProviderSignIn is the shared tail of Apple and Google sign-in. It resolves
@@ -259,6 +296,22 @@ type providerSignIn struct {
 func (h *Handlers) completeProviderSignIn(w http.ResponseWriter, r *http.Request, in providerSignIn) {
 	ctx := r.Context()
 
+	// Only an address the provider vouches for may grant anything: allowlist
+	// admission, the admin role, account linking, or being stored on the account.
+	verifiedEmail := ""
+	if in.emailVerified {
+		verifiedEmail = in.email
+	}
+	revoked, err := h.users.IsEmailRevoked(ctx, in.email)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "user lookup failed")
+		return
+	}
+	if revoked {
+		h.rejectSignIn(w, in, "access revoked")
+		return
+	}
+
 	// 1. Known identity.
 	user, err := h.users.GetUserByProviderIdentity(ctx, in.provider, in.sub)
 	if err != nil {
@@ -271,72 +324,78 @@ func (h *Handlers) completeProviderSignIn(w http.ResponseWriter, r *http.Request
 	}
 
 	// 2. Same person, different provider — link on a verified email match.
-	if in.emailVerified && in.email != "" {
-		existing, err := h.users.GetUserByEmail(ctx, in.email)
+	if verifiedEmail != "" {
+		existing, err := h.users.GetUserByEmail(ctx, verifiedEmail)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, "user lookup failed")
 			return
 		}
 		if existing != nil {
-			if err := h.users.LinkIdentity(ctx, existing.ID, in.provider, in.sub, in.email); err != nil {
+			if err := h.users.LinkIdentity(ctx, existing.ID, in.provider, in.sub, verifiedEmail); err != nil {
 				h.log.Error("link identity failed", "err", err, "user_id", existing.ID, "provider", in.provider)
 				writeError(w, http.StatusInternalServerError, "account link failed")
 				return
 			}
-			h.log.Info("linked new identity to existing user", "user_id", existing.ID, "provider", in.provider, "email", in.email)
+			h.log.Info("linked new identity to existing user", "user_id", existing.ID, "provider", in.provider, "email", verifiedEmail)
 			h.finishSignIn(w, ctx, in, existing)
 			return
 		}
 	}
 
-	// 3. New user — gate on allowlist or invite.
-	allowed := h.emailAllowed(ctx, in.email)
-	var invite *auth.Invite
-	if code := normalizeInviteCode(in.inviteCode); code != "" {
-		if inv, err := h.users.GetInvite(ctx, code); err == nil && inv != nil && inv.Pending() {
-			invite = inv
-		}
-	}
-	if !allowed && invite == nil {
-		h.log.Warn("sign-in rejected: not allowlisted and no valid invite", "provider", in.provider, "sub", in.sub, "email", in.email)
-		writeError(w, http.StatusForbidden, in.rejectMsg)
-		return
-	}
-
-	role := h.roleForNewUser(ctx, in.email)
-	if invite != nil {
-		role = invite.Role
-	}
+	// 3. New user — gate on a valid invite or the allowlist.
 	// legacyAppleSub anchors the NOT NULL users.apple_sub column; empty lets the
 	// store synthesize "google:<sub>" for non-Apple providers.
-	legacyAppleSub := ""
+	nu := auth.NewUser{Provider: in.provider, Sub: in.sub, Email: verifiedEmail, Name: in.name}
 	if in.provider == auth.ProviderApple {
-		legacyAppleSub = in.sub
-	}
-	user, err = h.users.CreateUserWithIdentity(ctx, in.provider, in.sub, legacyAppleSub, in.email, in.name, role)
-	if err != nil {
-		h.log.Error("create user failed", "err", err)
-		writeError(w, http.StatusInternalServerError, "user create failed")
-		return
+		nu.LegacyAppleSub = in.sub
 	}
 
-	if invite != nil {
-		if len(invite.Cameras) > 0 {
-			if err := h.users.SetUserCameras(ctx, user.ID, invite.Cameras); err != nil {
-				h.log.Warn("apply invite camera scope failed", "user_id", user.ID, "err", err)
-			}
-		}
-		if ok, err := h.users.ConsumeInvite(ctx, invite.Code, user.ID); err != nil || !ok {
-			h.log.Warn("consume invite failed/raced", "code", invite.Code, "ok", ok, "err", err)
+	viaInvite := false
+	if code := normalizeInviteCode(in.inviteCode); code != "" {
+		user, err = h.users.CreateUserFromInvite(ctx, nu, code)
+		switch {
+		case err == nil:
+			viaInvite = true
+		case !errors.Is(err, auth.ErrInviteUnavailable):
+			h.log.Error("create invited user failed", "err", err)
+			writeError(w, http.StatusInternalServerError, "user create failed")
+			return
 		}
 	}
-	h.log.Info("new user created", "user_id", user.ID, "role", user.Role, "provider", in.provider, "email", in.email, "via_invite", invite != nil)
+	if !viaInvite {
+		if !h.emailAllowed(ctx, verifiedEmail) {
+			h.rejectSignIn(w, in, "not allowlisted and no valid invite")
+			return
+		}
+		nu.Role = h.roleForNewUser(ctx, verifiedEmail)
+		user, err = h.users.CreateUserWithIdentity(ctx, nu.Provider, nu.Sub, nu.LegacyAppleSub, nu.Email, nu.Name, nu.Role)
+		if err != nil {
+			h.log.Error("create user failed", "err", err)
+			writeError(w, http.StatusInternalServerError, "user create failed")
+			return
+		}
+	}
+	h.log.Info("new user created", "user_id", user.ID, "role", user.Role, "provider", in.provider, "email", verifiedEmail, "via_invite", viaInvite)
 	h.finishSignIn(w, ctx, in, user)
+}
+
+func (h *Handlers) rejectSignIn(w http.ResponseWriter, in providerSignIn, reason string) {
+	h.log.Warn("sign-in rejected", "reason", reason, "provider", in.provider, "sub", in.sub, "email", in.email)
+	writeError(w, http.StatusForbidden, in.rejectMsg)
 }
 
 // finishSignIn registers the gateway with the push relay on the owner's first
 // sign-in (best-effort; see maybeRegisterRelayAtSignIn), then issues app tokens.
 func (h *Handlers) finishSignIn(w http.ResponseWriter, ctx context.Context, in providerSignIn, u *auth.User) {
+	active, err := h.users.IsUserActive(ctx, u.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "user lookup failed")
+		return
+	}
+	if !active {
+		h.rejectSignIn(w, in, "account disabled")
+		return
+	}
 	h.maybeRegisterRelayAtSignIn(ctx, in, u)
 	h.issueTokens(w, ctx, u.ID)
 }
@@ -355,12 +414,17 @@ func (h *Handlers) maybeRegisterRelayAtSignIn(ctx context.Context, in providerSi
 	if tok, err := h.settings.GetString(ctx, settings.KeyRelayInstanceToken, ""); err == nil && tok != "" {
 		return // already registered
 	}
-	provider, idToken := in.provider, in.idToken
+	reg := relayclient.RegisterRequest{
+		Provider:      in.provider,
+		IDToken:       in.idToken,
+		NonceSecret:   in.nonceSecret,
+		GatewayOrigin: in.origin,
+	}
 	go func() {
 		// Detached context: the sign-in request's ctx is canceled once it returns.
 		bg, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		resp, err := apns.RegisterWithRelay(bg, h.cfg.Relay.URL, provider, idToken, nil)
+		resp, err := apns.RegisterWithRelay(bg, h.cfg.Relay.URL, reg, nil)
 		if err != nil {
 			h.log.Warn("relay registration failed; will retry on next admin sign-in", "err", err)
 			return
@@ -449,8 +513,14 @@ func (h *Handlers) Refresh(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid refresh token")
 		return
 	}
-	if err := h.users.RevokeRefreshToken(r.Context(), tok.ID); err != nil {
-		h.log.Warn("failed to revoke old refresh token", "err", err)
+	active, err := h.users.IsUserActive(r.Context(), tok.UserID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "user lookup failed")
+		return
+	}
+	if !active {
+		writeError(w, http.StatusUnauthorized, "invalid refresh token")
+		return
 	}
 	h.issueTokens(w, r.Context(), tok.UserID)
 }
@@ -550,6 +620,32 @@ func (h *Handlers) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		h.log.Error("device register failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "register failed")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+type unregisterDeviceRequest struct {
+	APNsToken string `json:"apns_token"`
+}
+
+// UnregisterDevice stops pushes to one of the caller's devices. The apps call it
+// on sign-out. Removing a token that isn't registered to the caller is a no-op.
+func (h *Handlers) UnregisterDevice(w http.ResponseWriter, r *http.Request) {
+	userID, ok := auth.UserID(r.Context())
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "auth required")
+		return
+	}
+	var req unregisterDeviceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.APNsToken == "" {
+		writeError(w, http.StatusBadRequest, "apns_token required")
+		return
+	}
+	if _, err := h.db.ExecContext(r.Context(),
+		`DELETE FROM devices WHERE apns_token = ? AND user_id = ?`, req.APNsToken, userID); err != nil {
+		h.log.Error("device unregister failed", "err", err)
+		writeError(w, http.StatusInternalServerError, "unregister failed")
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -757,6 +853,10 @@ func (h *Handlers) ListEvents(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "access check failed")
 		return
 	} else if !all {
+		if len(allowed) == 0 {
+			writeJSON(w, http.StatusOK, map[string]any{"events": []events.Event{}})
+			return
+		}
 		f.Cameras = allowed
 	}
 	if s := q.Get("since"); s != "" {

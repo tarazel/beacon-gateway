@@ -33,8 +33,18 @@ func TestMiddlewareScopes(t *testing.T) {
 		t.Fatalf("IssueMedia: %v", err)
 	}
 
-	general := Middleware(issuer)
-	mediaMW := MediaMiddleware(issuer)
+	users, ctx := newTestStore(t)
+	if _, err := users.db.ExecContext(ctx,
+		`INSERT INTO users (id, apple_sub, role, created_at) VALUES ('user-1', 'sub-1', 'member', 0)`); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	ghost, _, err := issuer.Issue("deleted-user")
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	general := Middleware(issuer, users)
+	mediaMW := MediaMiddleware(issuer, users)
 
 	cases := []struct {
 		name   string
@@ -49,6 +59,8 @@ func TestMiddlewareScopes(t *testing.T) {
 		{"media: access ok", mediaMW, access, http.StatusOK},
 		{"media: media ok", mediaMW, media, http.StatusOK},
 		{"media: missing token", mediaMW, "", http.StatusUnauthorized},
+		{"general: deleted user", general, ghost, http.StatusUnauthorized},
+		{"media: deleted user", mediaMW, ghost, http.StatusUnauthorized},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

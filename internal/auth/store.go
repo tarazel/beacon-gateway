@@ -198,23 +198,53 @@ func (s *Store) LinkIdentity(ctx context.Context, userID, provider, sub, email s
 	return err
 }
 
+// NewUser describes an account to create along with its first linked identity.
+type NewUser struct {
+	Provider string
+	Sub      string
+	// LegacyAppleSub fills the NOT NULL users.apple_sub anchor: it is the real
+	// Apple sub for Apple sign-ins, and defaults to a synthetic "<provider>:<sub>"
+	// value for other providers (see the 0009 migration note).
+	LegacyAppleSub string
+	Email          string
+	Name           string
+	Role           string
+}
+
+// ErrInviteUnavailable means the invite is unknown, expired, or already used.
+var ErrInviteUnavailable = errors.New("invite is no longer available")
+
 // CreateUserWithIdentity creates a brand-new user with one linked identity, in a
-// single transaction. legacyAppleSub fills the NOT NULL users.apple_sub anchor: it
-// is the real Apple sub for Apple sign-ins, and a synthetic "google:<sub>" value
-// for other providers (see the 0009 migration note).
+// single transaction.
 func (s *Store) CreateUserWithIdentity(ctx context.Context, provider, sub, legacyAppleSub, email, name, role string) (*User, error) {
-	if role != RoleAdmin {
-		role = RoleMember
+	return s.createUser(ctx, NewUser{
+		Provider: provider, Sub: sub, LegacyAppleSub: legacyAppleSub,
+		Email: email, Name: name, Role: role,
+	}, "")
+}
+
+// CreateUserFromInvite creates a user, redeems the invite, and applies its role
+// and camera scope in one transaction, so an invite can never admit more people
+// than it allows. It returns ErrInviteUnavailable, creating nothing, if the
+// invite can't be redeemed. nu.Role is ignored.
+func (s *Store) CreateUserFromInvite(ctx context.Context, nu NewUser, code string) (*User, error) {
+	if code == "" {
+		return nil, ErrInviteUnavailable
 	}
+	return s.createUser(ctx, nu, code)
+}
+
+func (s *Store) createUser(ctx context.Context, nu NewUser, inviteCode string) (*User, error) {
+	legacyAppleSub := nu.LegacyAppleSub
 	if legacyAppleSub == "" {
-		legacyAppleSub = provider + ":" + sub
+		legacyAppleSub = nu.Provider + ":" + nu.Sub
 	}
 	u := User{
 		ID:        uuid.NewString(),
 		AppleSub:  legacyAppleSub,
-		Email:     email,
-		Name:      name,
-		Role:      role,
+		Email:     nu.Email,
+		Name:      nu.Name,
+		Role:      nu.Role,
 		CreatedAt: time.Now(),
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -222,6 +252,22 @@ func (s *Store) CreateUserWithIdentity(ctx context.Context, provider, sub, legac
 		return nil, err
 	}
 	defer tx.Rollback()
+
+	var cameras []string
+	if inviteCode != "" {
+		inv, err := scanInvite(tx.QueryRowContext(ctx, `SELECT `+inviteCols+` FROM invites WHERE code = ?`, inviteCode))
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, ErrInviteUnavailable
+		}
+		if err != nil {
+			return nil, err
+		}
+		u.Role, cameras = inv.Role, inv.Cameras
+	}
+	if u.Role != RoleAdmin {
+		u.Role = RoleMember
+	}
+
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO users (id, apple_sub, email, name, role, created_at) VALUES (?, ?, ?, ?, ?, ?)`,
 		u.ID, u.AppleSub, nullable(u.Email), nullable(u.Name), u.Role, u.CreatedAt.Unix(),
@@ -230,9 +276,21 @@ func (s *Store) CreateUserWithIdentity(ctx context.Context, provider, sub, legac
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO user_identities (provider, provider_sub, user_id, email, created_at) VALUES (?, ?, ?, ?, ?)`,
-		provider, sub, u.ID, nullable(email), u.CreatedAt.Unix(),
+		nu.Provider, nu.Sub, u.ID, nullable(nu.Email), u.CreatedAt.Unix(),
 	); err != nil {
 		return nil, err
+	}
+	if inviteCode != "" {
+		ok, err := consumeInvite(ctx, tx, inviteCode, u.ID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			return nil, ErrInviteUnavailable
+		}
+		if err := insertUserCameras(ctx, tx, u.ID, cameras); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -316,6 +374,13 @@ func (s *Store) SetUserCameras(ctx context.Context, userID string, cameras []str
 	if _, err := tx.ExecContext(ctx, `DELETE FROM user_cameras WHERE user_id = ?`, userID); err != nil {
 		return err
 	}
+	if err := insertUserCameras(ctx, tx, userID, cameras); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func insertUserCameras(ctx context.Context, tx *sql.Tx, userID string, cameras []string) error {
 	seen := make(map[string]struct{}, len(cameras))
 	for _, c := range cameras {
 		c = strings.TrimSpace(c)
@@ -330,7 +395,7 @@ func (s *Store) SetUserCameras(ctx context.Context, userID string, cameras []str
 			return err
 		}
 	}
-	return tx.Commit()
+	return nil
 }
 
 func (s *Store) GetUser(ctx context.Context, id string) (*User, error) {
@@ -376,29 +441,24 @@ func (s *Store) IssueRefreshToken(ctx context.Context, userID string, ttl time.D
 	return raw, tok, nil
 }
 
+// ConsumeRefreshToken redeems a refresh token, revoking it in the same statement
+// that checks it, so concurrent attempts can't redeem it twice.
 func (s *Store) ConsumeRefreshToken(ctx context.Context, raw string) (*RefreshToken, error) {
-	hash := hashToken(raw)
-	row := s.db.QueryRowContext(ctx,
-		`SELECT id, user_id, expires_at FROM refresh_tokens WHERE token_hash = ? AND revoked_at IS NULL`, hash)
+	now := time.Now().Unix()
+	row := s.db.QueryRowContext(ctx, `
+		UPDATE refresh_tokens SET revoked_at = ?1
+		WHERE token_hash = ?2 AND revoked_at IS NULL AND expires_at >= ?1
+		RETURNING id, user_id, expires_at`, now, hashToken(raw))
 	var tok RefreshToken
 	var expires int64
 	if err := row.Scan(&tok.ID, &tok.UserID, &expires); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errors.New("refresh token not found or revoked")
+			return nil, errors.New("refresh token not found, expired, or revoked")
 		}
 		return nil, err
 	}
 	tok.ExpiresAt = time.Unix(expires, 0)
-	if time.Now().After(tok.ExpiresAt) {
-		return nil, errors.New("refresh token expired")
-	}
 	return &tok, nil
-}
-
-func (s *Store) RevokeRefreshToken(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx,
-		`UPDATE refresh_tokens SET revoked_at = ? WHERE id = ?`, time.Now().Unix(), id)
-	return err
 }
 
 type AllowedEmail struct {
@@ -407,30 +467,28 @@ type AllowedEmail struct {
 	AddedAt time.Time
 }
 
+// AllowEmail adds an email to the allowlist and lifts any earlier revocation.
 func (s *Store) AllowEmail(ctx context.Context, email, note string) error {
 	email = canonicalEmail(email)
 	if email == "" {
 		return errors.New("email required")
 	}
-	_, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO allowed_emails (email, note, added_at) VALUES (?, ?, ?)
 		 ON CONFLICT(email) DO UPDATE SET note = excluded.note`,
 		email, nullable(note), time.Now().Unix(),
-	)
-	return err
-}
-
-func (s *Store) RevokeEmail(ctx context.Context, email string) (bool, error) {
-	email = canonicalEmail(email)
-	if email == "" {
-		return false, errors.New("email required")
+	); err != nil {
+		return err
 	}
-	res, err := s.db.ExecContext(ctx, `DELETE FROM allowed_emails WHERE email = ?`, email)
-	if err != nil {
-		return false, err
+	if err := restoreAccess(ctx, tx, email); err != nil {
+		return err
 	}
-	n, _ := res.RowsAffected()
-	return n > 0, nil
+	return tx.Commit()
 }
 
 func (s *Store) ListAllowedEmails(ctx context.Context) ([]AllowedEmail, error) {

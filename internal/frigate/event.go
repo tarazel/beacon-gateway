@@ -1,6 +1,15 @@
 package frigate
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+	"regexp"
+)
+
+// eventID matches Frigate's ids ("<unix time>-<random>"). Ids become file names
+// and URL path segments, and anything able to publish to the broker chooses them,
+// so separators and leading dots are refused.
+var eventID = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9._-]{0,127}$`)
 
 type EventPhase string
 
@@ -33,6 +42,9 @@ func ParseEvent(payload []byte) (*MQTTEvent, error) {
 	var e MQTTEvent
 	if err := json.Unmarshal(payload, &e); err != nil {
 		return nil, err
+	}
+	if !eventID.MatchString(e.After.ID) {
+		return nil, fmt.Errorf("invalid event id %q", e.After.ID)
 	}
 	return &e, nil
 }

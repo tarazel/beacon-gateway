@@ -18,7 +18,7 @@ Usage: beacon-admin [--db <path>] <command> [args]
 
 Commands:
   allow <email> [--note <text>]      add an email to the allowlist
-  revoke <email>                     remove an email from the allowlist
+  revoke <email>                     block an email and disable its account(s)
   list-allowed                       list allowlisted emails
   list-users                         list registered users (with role + camera scope)
   set-role <id-or-email> <role>      set a user's role: admin or member
@@ -144,24 +144,17 @@ func cmdRevoke(ctx context.Context, store *auth.Store, args []string) {
 	if len(args) != 1 {
 		fatal("usage: revoke <email>")
 	}
-	email := args[0]
-	existed, err := store.RevokeEmail(ctx, email)
+	email := strings.ToLower(strings.TrimSpace(args[0]))
+	res, err := store.RevokeAccess(ctx, email)
 	if err != nil {
 		fatal("revoke: %v", err)
 	}
-	if !existed {
-		fmt.Printf("not in allowlist: %s\n", strings.ToLower(strings.TrimSpace(email)))
-		return
+	fmt.Printf("revoked: %s (accounts disabled: %d, refresh tokens revoked: %d, devices removed: %d)\n",
+		email, res.Users, res.Tokens, res.Devices)
+	if res.Users == 0 && !res.Allowlisted {
+		fmt.Println("note: no account or allowlist entry matched; the email is now blocked — check the spelling")
 	}
-
-	// Revoke active sessions for any user with that email.
-	if u, err := store.FindUserByIDOrEmail(ctx, email); err == nil && u != nil {
-		if n, err := store.RevokeAllRefreshTokens(ctx, u.ID); err == nil && n > 0 {
-			fmt.Printf("revoked %s (also revoked %d active refresh tokens for user %s)\n", email, n, u.ID)
-			return
-		}
-	}
-	fmt.Printf("revoked: %s\n", strings.ToLower(strings.TrimSpace(email)))
+	fmt.Printf("undo with: beacon-admin allow %s\n", email)
 }
 
 func cmdListAllowed(ctx context.Context, store *auth.Store) {

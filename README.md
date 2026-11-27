@@ -126,9 +126,17 @@ beacon-admin set-cameras <id-or-email> [camera ...]   # no cameras = sees all
 beacon-admin invite create [--role member|admin] [--camera <id>]... [--expires 168h] [--note <text>]
 beacon-admin invite list
 beacon-admin invite delete <code>
-beacon-admin allow <email> [--note <text>]            # legacy allowlist (invites are easier)
+beacon-admin allow <email> [--note <text>]            # allowlist; also undoes a revoke
+beacon-admin revoke <email>                           # block an email and disable its account
 beacon-admin delete-user <id-or-email>
 ```
+
+## Sign-in and your gateway URL
+
+Set `PUBLIC_BASE_URL` to the address you enter in the app: sign-in tokens are
+bound to it, so a mismatch is rejected. List any other addresses you use in
+`AUTH_ALLOWED_ORIGINS`. Apps too old to bind their token need
+`REQUIRE_SIGNIN_NONCE=false` until they're updated.
 
 ## iOS app
 

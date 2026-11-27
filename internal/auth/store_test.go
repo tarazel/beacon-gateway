@@ -98,18 +98,21 @@ func TestAllowlistRoundtrip(t *testing.T) {
 		t.Errorf("note not updated: %q", list[0].Note)
 	}
 
-	existed, err := s.RevokeEmail(ctx, "alice@example.com")
-	if err != nil || !existed {
-		t.Errorf("revoke: existed=%v err=%v", existed, err)
+	res, err := s.RevokeAccess(ctx, "alice@example.com")
+	if err != nil || !res.Allowlisted {
+		t.Errorf("revoke: %+v err=%v", res, err)
 	}
 	ok, _ = s.IsEmailAllowed(ctx, "alice@example.com")
 	if ok {
 		t.Error("email should not be allowed after revoke")
 	}
 
-	existed, _ = s.RevokeEmail(ctx, "never@example.com")
-	if existed {
-		t.Error("revoking unknown email should report existed=false")
+	res, err = s.RevokeAccess(ctx, "never@example.com")
+	if err != nil || res.Allowlisted || res.Users != 0 {
+		t.Errorf("revoking an unknown email: %+v err=%v", res, err)
+	}
+	if revoked, _ := s.IsEmailRevoked(ctx, "Never@Example.com"); !revoked {
+		t.Error("an unknown email should still end up blocked")
 	}
 }
 
