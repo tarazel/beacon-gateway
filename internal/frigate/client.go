@@ -406,6 +406,7 @@ func (c *Client) cacheClip(ctx context.Context, id, cacheDir, cachePath string) 
 	if !corrupt {
 		args = append(args, "-fflags", "+genpts")
 	}
+	args = append(args, mp4Input...)
 	args = append(args, "-i", raw, "-map", "0:v:0", "-map", "0:a:0?", "-c:v", "copy")
 	if corrupt {
 		args = append(args,
@@ -444,17 +445,24 @@ const (
 	clipRebuildFPS = 20
 )
 
+// mp4Input pins ffmpeg and ffprobe to reading a local MP4. Without it they guess
+// the format from the content, which would expose every demuxer and protocol in
+// the build to whatever was downloaded.
+var mp4Input = []string{"-protocol_whitelist", "file", "-f", "mov"}
+
+// probe runs ffprobe over a downloaded clip.
+func probe(ctx context.Context, path string, args ...string) ([]byte, error) {
+	full := append([]string{"-v", "error"}, mp4Input...)
+	full = append(full, args...)
+	full = append(full, "-of", "default=nw=1:nk=1", path)
+	return exec.CommandContext(ctx, "ffprobe", full...).Output()
+}
+
 // probeVideoCodec returns the first video stream's codec name (e.g. "hevc",
 // "h264") via ffprobe, or "" if it can't be determined. Used to decide the
 // output codec tag in the remux.
 func probeVideoCodec(ctx context.Context, path string) string {
-	out, err := exec.CommandContext(ctx, "ffprobe",
-		"-v", "error",
-		"-select_streams", "v:0",
-		"-show_entries", "stream=codec_name",
-		"-of", "default=nw=1:nk=1",
-		path,
-	).Output()
+	out, err := probe(ctx, path, "-select_streams", "v:0", "-show_entries", "stream=codec_name")
 	if err != nil {
 		return ""
 	}
@@ -464,12 +472,7 @@ func probeVideoCodec(ctx context.Context, path string) string {
 // clipDurationSeconds returns the container duration in seconds via ffprobe, or 0
 // if it can't be determined. Used to detect the EXT-1 corruption (absurd duration).
 func clipDurationSeconds(ctx context.Context, path string) float64 {
-	out, err := exec.CommandContext(ctx, "ffprobe",
-		"-v", "error",
-		"-show_entries", "format=duration",
-		"-of", "default=nw=1:nk=1",
-		path,
-	).Output()
+	out, err := probe(ctx, path, "-show_entries", "format=duration")
 	if err != nil {
 		return 0
 	}
