@@ -38,9 +38,11 @@ Camera ──RTSP──> Frigate ──MQTT──> Gateway (Go) ──APNs──
   the app falls back to HLS**, which the gateway *does* proxy (`/api/cameras/{id}/
   hls/*`): it fetches go2rtc's HLS (H.264 substream — the hard rule holds), rewrites
   every playlist URI to route segments back through the authed gateway, and streams
-  them. Segment URLs are SameOrigin-checked before fetch (they arrive in a client
-  param — else SSRF). The app tries WebRTC first and auto-falls-back to HLS on
-  failure (plus a manual toggle).
+  them. Those URLs come back in a client param, so the gateway fetches one only if
+  it is signed for that camera **and** is under go2rtc's `/api/hls/` — a host check
+  alone exposes go2rtc's whole API, including camera passwords. Never proxy any
+  other go2rtc path from client input. The app tries WebRTC first and
+  auto-falls-back to HLS on failure (plus a manual toggle).
 
 ---
 
@@ -94,7 +96,7 @@ GET    /api/notification-rules         # caller's own rules { labels[], zones[],
 PUT    /api/notification-rules         # replace caller's rules (server normalizes/clamps; echoes result)
 GET    /api/cameras/{id}/live          # descriptor { protocol, webrtc_url, hls_url } — hls_url embeds a short-lived HLS token
 GET    /api/cameras/{id}/hls/index.m3u8  # HLS playlist proxy (H.264 substream via go2rtc); token via ?token= or Bearer
-GET    /api/cameras/{id}/hls/r         # HLS segment/sub-playlist proxy (?u=<b64 go2rtc URL>&token=)
+GET    /api/cameras/{id}/hls/r         # HLS segment/sub-playlist proxy (?u=<b64 go2rtc URL>&sig=&token=)
 
 POST   /api/checkout                   # ADMIN: { plan? } → { url } — Stripe Checkout via relay (relay mode only)
 GET    /api/subscription               # { managed, plan, sub_status, active, expires_at } — household Beacon Pro status

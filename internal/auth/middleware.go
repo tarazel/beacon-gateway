@@ -32,12 +32,13 @@ func MediaMiddleware(issuer *JWTIssuer) func(http.Handler) http.Handler {
 	return authMiddleware(issuer, authOpts{allowMedia: true})
 }
 
-// HLSMiddleware authorizes the HLS live-view endpoints. It accepts an access,
-// media, or HLS-scoped token, and (uniquely) also reads the token from a `token`
-// query param — AVPlayer can't set an Authorization header on HLS playlist/segment
-// requests, so the token rides in the URL the live descriptor hands back.
+// HLSMiddleware authorizes the HLS live-view endpoints. It accepts an access or
+// HLS-scoped token (not the long-lived media token, which is for snapshots and
+// clips only), and (uniquely) also reads the token from a `token` query param —
+// AVPlayer can't set an Authorization header on HLS playlist/segment requests, so
+// the token rides in the URL the live descriptor hands back.
 func HLSMiddleware(issuer *JWTIssuer) func(http.Handler) http.Handler {
-	return authMiddleware(issuer, authOpts{allowMedia: true, allowHLS: true, allowQuery: true})
+	return authMiddleware(issuer, authOpts{allowHLS: true, allowQuery: true})
 }
 
 type authOpts struct {

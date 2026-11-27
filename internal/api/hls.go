@@ -1,6 +1,8 @@
 package api
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/base64"
 	"io"
 	"net/http"
@@ -20,9 +22,10 @@ import (
 // The gateway is the only public surface, so it PROXIES the playlist and every
 // segment from go2rtc rather than exposing go2rtc. The playlist's media URIs are
 // rewritten to point back at HLSResource, each carrying the original absolute
-// go2rtc URL (base64) plus the caller's token. HLSResource SameOrigin-validates
-// that URL before fetching (the URL comes from a client param — without the check
-// it would be an SSRF hole).
+// go2rtc URL (base64), a signature, and the caller's token. That URL comes back
+// as a client param, so HLSResource fetches it only if the signature shows the
+// gateway issued it for this camera AND it is an HLS path on go2rtc. Without both
+// checks a caller could reach go2rtc's whole API, or another camera's stream.
 
 const maxPlaylistBytes = 1 << 20 // 1 MiB — playlists are tiny; segments stream unbounded
 
@@ -93,9 +96,13 @@ func (h *Handlers) HLSResource(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid resource")
 		return
 	}
+	sig, err := base64.RawURLEncoding.DecodeString(r.URL.Query().Get("sig"))
+	if err != nil || !hmac.Equal(sig, h.signHLSResource(id, string(rawURL))) {
+		writeError(w, http.StatusBadRequest, "invalid resource")
+		return
+	}
 	target, err := url.Parse(string(rawURL))
-	if err != nil || !h.go2rtc.SameOrigin(target) {
-		// SameOrigin guards against a client pointing `u` at an arbitrary host.
+	if err != nil || !h.go2rtc.IsHLSResource(target) {
 		writeError(w, http.StatusBadRequest, "invalid resource")
 		return
 	}
@@ -136,12 +143,27 @@ func (h *Handlers) HLSResource(w http.ResponseWriter, r *http.Request) {
 	_, _ = io.Copy(w, resp.Body)
 }
 
+// signHLSResource authenticates a go2rtc URL as one the gateway put in a playlist
+// for cameraID. The key is derived from the JWT signing key so URLs stay valid
+// across a restart without adding configuration.
+func (h *Handlers) signHLSResource(cameraID, absURL string) []byte {
+	derive := hmac.New(sha256.New, h.cfg.Auth.JWTSigningKey)
+	derive.Write([]byte("beacon hls resource v1"))
+	mac := hmac.New(sha256.New, derive.Sum(nil))
+	mac.Write([]byte(cameraID + "\x00" + absURL))
+	return mac.Sum(nil)
+}
+
 // hlsResourceURL builds the gateway URL a rewritten playlist entry points at:
-// the absolute go2rtc URL (base64) plus the caller's token, so AVPlayer can fetch
-// segments directly (no Authorization header needed).
+// the absolute go2rtc URL (base64), its signature, and the caller's token, so
+// AVPlayer can fetch segments directly (no Authorization header needed).
 func (h *Handlers) hlsResourceURL(cameraID, token, absURL string) string {
 	base := strings.TrimRight(h.cfg.PublicBaseURL, "/")
-	q := url.Values{"u": {base64.RawURLEncoding.EncodeToString([]byte(absURL))}, "token": {token}}
+	q := url.Values{
+		"u":     {base64.RawURLEncoding.EncodeToString([]byte(absURL))},
+		"sig":   {base64.RawURLEncoding.EncodeToString(h.signHLSResource(cameraID, absURL))},
+		"token": {token},
+	}
 	return base + "/api/cameras/" + cameraID + "/hls/r?" + q.Encode()
 }
 
