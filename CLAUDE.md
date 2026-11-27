@@ -83,7 +83,7 @@ POST   /api/auth/apple/callback        # Apple web-flow (Android SIWA) form_post
 POST   /api/auth/google                # Sign in with Google — id_token → JWT + refresh (501 if GOOGLE_CLIENT_ID unset)
 POST   /api/auth/refresh               # refresh token → new JWT + refresh
 
-POST   /api/devices                    # register push device token { apns_token, platform?, app_version? } — platform "ios"(default)|"android"
+POST   /api/devices                    # register push device token { apns_token, platform?, app_version?, environment? } — platform "ios"(default)|"android"; environment "production"|"sandbox"
 GET    /api/me                         # { user_id, email, name, role, is_admin, all_cameras, cameras[] }
 GET    /api/mute                       # { muted_until, cameras:[{camera,muted_until}] }
 POST   /api/mute                       # { duration_seconds, camera? } — camera omitted = global; 0 clears
@@ -306,8 +306,11 @@ local development. APNs is skipped automatically when not configured.
 - **`internal/relayclient` is a hand-copied subset of the relay's contract** — if
   the relay's `PushRequest`/`PushResponse`/`RegisterResponse` change, update both.
 - **`@MainActor`-style cross-process gotchas live in the iOS repo**, not here.
-- **APNs sandbox vs production:** `APNS_USE_SANDBOX=true` for TestFlight/debug,
-  `false` for App Store. The push topic (`APNS_BUNDLE_ID`) is the **app** bundle
+- **APNs sandbox vs production is per device.** The iOS app reports the
+  `environment` of its signing profile at `POST /api/devices` (development-signed
+  = `sandbox`; TestFlight / App Store = `production`). `APNS_USE_SANDBOX` is only
+  the fallback for devices that report none. A wrong value shows up as
+  `BadDeviceToken` and the device row is pruned. The push topic (`APNS_BUNDLE_ID`) is the **app** bundle
   ID, not the extension's.
 - **Refresh handler / token rotation:** refresh tokens are single-use but have a
   90-day lifetime; no reuse-after-rotation auto-revoke yet.
