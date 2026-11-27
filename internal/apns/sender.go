@@ -48,8 +48,16 @@ type Sender struct {
 	transport Transport
 	db        *sql.DB
 	log       *slog.Logger
-	sandbox   bool
-	ruler     Ruler
+	// sandbox picks the APNs environment for devices that didn't report one.
+	sandbox bool
+	ruler   Ruler
+}
+
+// route is one delivery bucket: each Deliver call targets a single platform and
+// a single APNs environment.
+type route struct {
+	platform    string
+	environment string // "production" | "sandbox"
 }
 
 // NewSender wires a Sender to a delivery Transport (DirectTransport or
@@ -75,7 +83,7 @@ func (s *Sender) SendToAll(ctx context.Context, n Notification) error {
 	// a scoped member must have a row for this camera.
 	now := time.Now().Unix()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT u.id, d.id, d.apns_token, d.platform
+		SELECT u.id, d.id, d.apns_token, d.platform, d.environment
 		FROM devices d
 		JOIN users u ON u.id = d.user_id
 		WHERE (u.muted_until IS NULL OR u.muted_until <= ?)
@@ -94,25 +102,36 @@ func (s *Sender) SendToAll(ctx context.Context, n Notification) error {
 	}
 	defer rows.Close()
 
-	// Group tokens by user so per-user notification rules can be applied once per
-	// user (scope + mute are already enforced by the query above).
+	defaultEnv := "production"
+	if s.sandbox {
+		defaultEnv = "sandbox"
+	}
+
 	// Group tokens by user so per-user notification rules can be applied once per
 	// user (scope + mute are already enforced by the query above). Track each
-	// token's platform so we can route it to the right push backend (APNs/FCM).
+	// token's route so it reaches the right push backend (APNs/FCM) and, for
+	// APNs, the environment that issued the token.
 	tokenToID := make(map[string]string)
-	tokenPlatform := make(map[string]string)
+	tokenRoute := make(map[string]route)
 	userTokens := make(map[string][]string)
 	var userOrder []string
 	for rows.Next() {
 		var userID, id, tok, platform string
-		if err := rows.Scan(&userID, &id, &tok, &platform); err != nil {
+		var environment sql.NullString
+		if err := rows.Scan(&userID, &id, &tok, &platform, &environment); err != nil {
 			return err
 		}
 		if platform == "" {
 			platform = "ios"
 		}
 		tokenToID[tok] = id
-		tokenPlatform[tok] = platform
+		// FCM has no sandbox/production split, so only iOS uses a reported value;
+		// keeping Android on the default avoids splitting its bucket.
+		env := defaultEnv
+		if platform == "ios" && environment.Valid {
+			env = environment.String
+		}
+		tokenRoute[tok] = route{platform: platform, environment: env}
 		if _, seen := userTokens[userID]; !seen {
 			userOrder = append(userOrder, userID)
 		}
@@ -128,10 +147,10 @@ func (s *Sender) SendToAll(ctx context.Context, n Notification) error {
 	}
 
 	// Apply each user's notification rules (label/zone/score/quiet-hours/cooldown),
-	// then bucket the surviving tokens by platform. A user filtered out here never
+	// then bucket the surviving tokens by route. A user filtered out here never
 	// reaches the relay/APNs.
 	ruleEv := RuleEvent{Camera: n.Camera, Label: n.Label, Zones: n.Zones, Score: n.Score}
-	byPlatform := make(map[string][]string)
+	byRoute := make(map[route][]string)
 	var totalTokens, filteredUsers int
 	for _, userID := range userOrder {
 		if s.ruler != nil && !s.ruler.Allows(ctx, userID, ruleEv) {
@@ -139,8 +158,8 @@ func (s *Sender) SendToAll(ctx context.Context, n Notification) error {
 			continue
 		}
 		for _, tok := range userTokens[userID] {
-			p := tokenPlatform[tok]
-			byPlatform[p] = append(byPlatform[p], tok)
+			r := tokenRoute[tok]
+			byRoute[r] = append(byRoute[r], tok)
 			totalTokens++
 		}
 	}
@@ -157,21 +176,19 @@ func (s *Sender) SendToAll(ctx context.Context, n Notification) error {
 	// RelayTransport the privacy-minimal one (event_id only). See Transport.BuildPayload.
 	// NOTE: this is the APNs payload shape. FCM (Android) needs its own payload —
 	// that translation lands with the FCM pusher in P2.9(b); today all devices are iOS.
-	env := "production"
-	if s.sandbox {
-		env = "sandbox"
-	}
-
-	// Deliver per platform so each bucket routes to the right backend (iOS→APNs,
-	// Android→FCM via the relay). Payloads are platform-specific (APNs JSON vs FCM
-	// data), so build per bucket.
+	// Deliver per route so each bucket reaches the right backend (iOS→APNs,
+	// Android→FCM via the relay) and APNs environment. Payloads are
+	// platform-specific (APNs JSON vs FCM data), so build per bucket. A failed
+	// bucket is recorded and the others are still attempted.
 	var results []Result
-	for platform, toks := range byPlatform {
-		payloadBytes, berr := s.transport.BuildPayload(platform, n)
+	var errs []string
+	for rt, toks := range byRoute {
+		payloadBytes, berr := s.transport.BuildPayload(rt.platform, n)
 		if berr != nil {
-			return fmt.Errorf("build payload (platform %s): %w", platform, berr)
+			errs = append(errs, fmt.Sprintf("build payload (platform %s): %v", rt.platform, berr))
+			continue
 		}
-		res, derr := s.transport.Deliver(ctx, platform, env, toks, payloadBytes)
+		res, derr := s.transport.Deliver(ctx, rt.platform, rt.environment, toks, payloadBytes)
 		if derr != nil {
 			// Relay mode, but the gateway hasn't registered yet (no admin has signed in
 			// to claim the instance). Transient: skip quietly and let pushes resume once
@@ -191,19 +208,19 @@ func (s *Sender) SendToAll(ctx context.Context, n Notification) error {
 					"event_id", n.EventID)
 				return derr
 			}
-			return fmt.Errorf("deliver via %s (platform %s): %w", s.transport.Name(), platform, derr)
+			errs = append(errs, fmt.Sprintf("deliver via %s (platform %s, env %s): %v", s.transport.Name(), rt.platform, rt.environment, derr))
+			continue
 		}
 		results = append(results, res...)
 	}
 
-	var errs []string
 	for _, r := range results {
 		switch r.Status {
 		case StatusSent:
-			s.log.Info("apns sent", "device_id", tokenToID[r.DeviceToken], "event_id", n.EventID, "transport", s.transport.Name())
+			s.log.Info("apns sent", "device_id", tokenToID[r.DeviceToken], "event_id", n.EventID, "transport", s.transport.Name(), "env", tokenRoute[r.DeviceToken].environment)
 		case StatusUnregistered:
 			id := tokenToID[r.DeviceToken]
-			s.log.Warn("apns: pruning unregistered device", "device_id", id, "reason", r.Reason)
+			s.log.Warn("apns: pruning unregistered device", "device_id", id, "reason", r.Reason, "env", tokenRoute[r.DeviceToken].environment)
 			if _, derr := s.db.ExecContext(ctx, `DELETE FROM devices WHERE id = ?`, id); derr != nil {
 				s.log.Warn("apns: failed to prune unregistered device", "device_id", id, "err", derr)
 			}

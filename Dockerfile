@@ -1,4 +1,4 @@
-FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS build
+FROM --platform=$BUILDPLATFORM golang:1.27-alpine AS build
 ARG TARGETOS
 ARG TARGETARCH
 WORKDIR /src
@@ -11,8 +11,9 @@ RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build -trimpath -ldflags=
 # into plain faststart MP4s that AVPlayer can play. The gateway binary is static
 # (CGO_ENABLED=0), so Alpine works fine; ca-certificates is needed for the
 # outbound HTTPS calls to Apple (JWKS + APNs).
-FROM alpine:3.20
-RUN apk add --no-cache ffmpeg ca-certificates tzdata \
+FROM alpine:3.24
+RUN apk upgrade --no-cache \
+    && apk add --no-cache ffmpeg ca-certificates tzdata \
     && adduser -D -H -u 65532 nonroot
 WORKDIR /app
 COPY --from=build /out/gateway /app/gateway

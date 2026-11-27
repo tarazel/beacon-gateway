@@ -507,6 +507,10 @@ type registerDeviceRequest struct {
 	// Platform routes the push backend: "ios" (APNs, default) or "android" (FCM).
 	// Empty defaults to "ios" for older iOS clients that don't send it.
 	Platform string `json:"platform,omitempty"`
+	// Environment is the APNs environment the token belongs to, "production" or
+	// "sandbox". Empty (older iOS clients, Android) leaves the gateway default
+	// (APNS_USE_SANDBOX) in effect.
+	Environment string `json:"environment,omitempty"`
 }
 
 func (h *Handlers) RegisterDevice(w http.ResponseWriter, r *http.Request) {
@@ -525,17 +529,24 @@ func (h *Handlers) RegisterDevice(w http.ResponseWriter, r *http.Request) {
 	if platform == "" {
 		platform = "ios"
 	}
+	switch req.Environment {
+	case "", "production", "sandbox":
+	default:
+		writeError(w, http.StatusBadRequest, "environment must be 'production' or 'sandbox'")
+		return
+	}
 	now := time.Now().Unix()
 	id := uuid.NewString()
 	_, err := h.db.ExecContext(r.Context(), `
-		INSERT INTO devices (id, user_id, apns_token, platform, app_version, last_seen_at, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO devices (id, user_id, apns_token, platform, app_version, environment, last_seen_at, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(apns_token) DO UPDATE SET
 			user_id = excluded.user_id,
 			platform = excluded.platform,
 			app_version = excluded.app_version,
+			environment = COALESCE(excluded.environment, devices.environment),
 			last_seen_at = excluded.last_seen_at
-	`, id, userID, req.APNsToken, platform, nullableStr(req.AppVersion), now, now)
+	`, id, userID, req.APNsToken, platform, nullableStr(req.AppVersion), nullableStr(req.Environment), now, now)
 	if err != nil {
 		h.log.Error("device register failed", "err", err)
 		writeError(w, http.StatusInternalServerError, "register failed")

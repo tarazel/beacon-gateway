@@ -38,9 +38,11 @@ Camera ──RTSP──> Frigate ──MQTT──> Gateway (Go) ──APNs──
   the app falls back to HLS**, which the gateway *does* proxy (`/api/cameras/{id}/
   hls/*`): it fetches go2rtc's HLS (H.264 substream — the hard rule holds), rewrites
   every playlist URI to route segments back through the authed gateway, and streams
-  them. Segment URLs are SameOrigin-checked before fetch (they arrive in a client
-  param — else SSRF). The app tries WebRTC first and auto-falls-back to HLS on
-  failure (plus a manual toggle).
+  them. Those URLs come back in a client param, so the gateway fetches one only if
+  it is signed for that camera **and** is under go2rtc's `/api/hls/` — a host check
+  alone exposes go2rtc's whole API, including camera passwords. Never proxy any
+  other go2rtc path from client input. The app tries WebRTC first and
+  auto-falls-back to HLS on failure (plus a manual toggle).
 
 ---
 
@@ -83,7 +85,7 @@ POST   /api/auth/apple/callback        # Apple web-flow (Android SIWA) form_post
 POST   /api/auth/google                # Sign in with Google — id_token → JWT + refresh (501 if GOOGLE_CLIENT_ID unset)
 POST   /api/auth/refresh               # refresh token → new JWT + refresh
 
-POST   /api/devices                    # register push device token { apns_token, platform?, app_version? } — platform "ios"(default)|"android"
+POST   /api/devices                    # register push device token { apns_token, platform?, app_version?, environment? } — platform "ios"(default)|"android"; environment "production"|"sandbox"
 GET    /api/me                         # { user_id, email, name, role, is_admin, all_cameras, cameras[] }
 GET    /api/mute                       # { muted_until, cameras:[{camera,muted_until}] }
 POST   /api/mute                       # { duration_seconds, camera? } — camera omitted = global; 0 clears
@@ -94,7 +96,7 @@ GET    /api/notification-rules         # caller's own rules { labels[], zones[],
 PUT    /api/notification-rules         # replace caller's rules (server normalizes/clamps; echoes result)
 GET    /api/cameras/{id}/live          # descriptor { protocol, webrtc_url, hls_url } — hls_url embeds a short-lived HLS token
 GET    /api/cameras/{id}/hls/index.m3u8  # HLS playlist proxy (H.264 substream via go2rtc); token via ?token= or Bearer
-GET    /api/cameras/{id}/hls/r         # HLS segment/sub-playlist proxy (?u=<b64 go2rtc URL>&token=)
+GET    /api/cameras/{id}/hls/r         # HLS segment/sub-playlist proxy (?u=<b64 go2rtc URL>&sig=&token=)
 
 POST   /api/checkout                   # ADMIN: { plan? } → { url } — Stripe Checkout via relay (relay mode only)
 GET    /api/subscription               # { managed, plan, sub_status, active, expires_at } — household Beacon Pro status
@@ -306,8 +308,11 @@ local development. APNs is skipped automatically when not configured.
 - **`internal/relayclient` is a hand-copied subset of the relay's contract** — if
   the relay's `PushRequest`/`PushResponse`/`RegisterResponse` change, update both.
 - **`@MainActor`-style cross-process gotchas live in the iOS repo**, not here.
-- **APNs sandbox vs production:** `APNS_USE_SANDBOX=true` for TestFlight/debug,
-  `false` for App Store. The push topic (`APNS_BUNDLE_ID`) is the **app** bundle
+- **APNs sandbox vs production is per device.** The iOS app reports the
+  `environment` of its signing profile at `POST /api/devices` (development-signed
+  = `sandbox`; TestFlight / App Store = `production`). `APNS_USE_SANDBOX` is only
+  the fallback for devices that report none. A wrong value shows up as
+  `BadDeviceToken` and the device row is pruned. The push topic (`APNS_BUNDLE_ID`) is the **app** bundle
   ID, not the extension's.
 - **Refresh handler / token rotation:** refresh tokens are single-use but have a
   90-day lifetime; no reuse-after-rotation auto-revoke yet.

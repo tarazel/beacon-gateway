@@ -2,9 +2,12 @@ package apns
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"io"
 	"log/slog"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"testing"
 
@@ -136,5 +139,89 @@ func TestSendToAll_GroupsByPlatform(t *testing.T) {
 	}
 	if got := tr.byPlatform["android"]; len(got) != 1 || got[0] != "tok-and" {
 		t.Errorf("android bucket = %v, want [tok-and]", got)
+	}
+}
+
+// envTransport records which tokens were delivered to which APNs environment and
+// can fail one environment's request outright.
+type envTransport struct {
+	captureTransport
+	byEnv   map[string][]string
+	failEnv string
+}
+
+func (e *envTransport) Deliver(ctx context.Context, platform, env string, tokens []string, payload []byte) ([]Result, error) {
+	if env == e.failEnv {
+		return nil, errors.New("boom")
+	}
+	if e.byEnv == nil {
+		e.byEnv = map[string][]string{}
+	}
+	e.byEnv[env] = append(e.byEnv[env], tokens...)
+	return e.captureTransport.Deliver(ctx, platform, env, tokens, payload)
+}
+
+// seedEnvDevices creates one admin with a sandbox, a production and an
+// unreported-environment iOS device.
+func seedEnvDevices(t *testing.T) *sql.DB {
+	t.Helper()
+	ctx := context.Background()
+	d, err := db.Open(ctx, filepath.Join(t.TempDir(), "test.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { d.Close() })
+	if _, err := d.ExecContext(ctx,
+		`INSERT INTO users (id, apple_sub, role, created_at) VALUES ('u1', 'sub-u1', 'admin', 0)`); err != nil {
+		t.Fatalf("seed user: %v", err)
+	}
+	if _, err := d.ExecContext(ctx, `
+		INSERT INTO devices (id, user_id, apns_token, environment, last_seen_at, created_at) VALUES
+		('d-sb', 'u1', 'tok-sandbox', 'sandbox', 0, 0),
+		('d-pr', 'u1', 'tok-prod', 'production', 0, 0),
+		('d-un', 'u1', 'tok-unset', NULL, 0, 0)`); err != nil {
+		t.Fatalf("seed devices: %v", err)
+	}
+	return d
+}
+
+func TestSendToAll_RoutesByDeviceEnvironment(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		defaultSandbox bool
+		want           map[string][]string
+	}{
+		{"default production", false, map[string][]string{
+			"sandbox": {"tok-sandbox"}, "production": {"tok-prod", "tok-unset"}}},
+		{"default sandbox", true, map[string][]string{
+			"sandbox": {"tok-sandbox", "tok-unset"}, "production": {"tok-prod"}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tr := &envTransport{}
+			sender := NewSender(tr, seedEnvDevices(t), nil, tc.defaultSandbox, discardLogger())
+			if err := sender.SendToAll(context.Background(), Notification{EventID: "e1", Camera: "front"}); err != nil {
+				t.Fatalf("SendToAll: %v", err)
+			}
+			for _, toks := range tr.byEnv {
+				sort.Strings(toks)
+			}
+			if !reflect.DeepEqual(tr.byEnv, tc.want) {
+				t.Fatalf("by env = %v, want %v", tr.byEnv, tc.want)
+			}
+		})
+	}
+}
+
+func TestSendToAll_FailedBucketDoesNotBlockOthers(t *testing.T) {
+	// Map iteration order is random, so repeat to cover the failing bucket going first.
+	for i := 0; i < 20; i++ {
+		tr := &envTransport{failEnv: "sandbox"}
+		sender := NewSender(tr, seedEnvDevices(t), nil, false, discardLogger())
+		if err := sender.SendToAll(context.Background(), Notification{EventID: "e1", Camera: "front"}); err == nil {
+			t.Fatal("expected the failed bucket to be reported")
+		}
+		if got := len(tr.byEnv["production"]); got != 2 {
+			t.Fatalf("production bucket delivered %d tokens, want 2", got)
+		}
 	}
 }
