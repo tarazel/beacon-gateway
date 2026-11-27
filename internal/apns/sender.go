@@ -86,7 +86,8 @@ func (s *Sender) SendToAll(ctx context.Context, n Notification) error {
 		SELECT u.id, d.id, d.apns_token, d.platform, d.environment
 		FROM devices d
 		JOIN users u ON u.id = d.user_id
-		WHERE (u.muted_until IS NULL OR u.muted_until <= ?)
+		WHERE u.disabled_at IS NULL
+		  AND (u.muted_until IS NULL OR u.muted_until <= ?)
 		  AND NOT EXISTS (
 		      SELECT 1 FROM camera_mutes cm
 		      WHERE cm.user_id = u.id AND cm.camera = ? AND cm.muted_until > ?

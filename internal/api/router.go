@@ -17,15 +17,16 @@ func NewRouter(h *Handlers, jwtIssuer *auth.JWTIssuer, store *auth.Store, log *s
 	mux.HandleFunc("POST /api/auth/google", h.GoogleSignIn)
 	mux.HandleFunc("POST /api/auth/refresh", h.Refresh)
 
-	protected := auth.Middleware(jwtIssuer)
+	protected := auth.Middleware(jwtIssuer, store)
 	// mediaProtected also accepts the long-lived media-scoped token the
 	// notification service extension uses (it can't refresh the access token).
-	mediaProtected := auth.MediaMiddleware(jwtIssuer)
+	mediaProtected := auth.MediaMiddleware(jwtIssuer, store)
 	adminOnly := auth.AdminOnly(store)
 	// admin wraps a handler so it runs behind Middleware (auth) then AdminOnly (role).
 	admin := func(next http.Handler) http.Handler { return protected(adminOnly(next)) }
 
 	mux.Handle("POST /api/devices", protected(http.HandlerFunc(h.RegisterDevice)))
+	mux.Handle("DELETE /api/devices", protected(http.HandlerFunc(h.UnregisterDevice)))
 	mux.Handle("GET /api/mute", protected(http.HandlerFunc(h.GetMute)))
 	mux.Handle("POST /api/mute", protected(http.HandlerFunc(h.SetMute)))
 	mux.Handle("DELETE /api/mute", protected(http.HandlerFunc(h.SetMute)))
@@ -61,11 +62,22 @@ func NewRouter(h *Handlers, jwtIssuer *auth.JWTIssuer, store *auth.Store, log *s
 	mux.Handle("POST /api/cameras/{id}/webrtc", protected(http.HandlerFunc(h.CameraWebRTC)))
 	// HLS off-network live view. Its own middleware also accepts the token from a
 	// `token` query param (AVPlayer can't set headers on HLS segment requests).
-	hlsProtected := auth.HLSMiddleware(jwtIssuer)
+	hlsProtected := auth.HLSMiddleware(jwtIssuer, store)
 	mux.Handle("GET /api/cameras/{id}/hls/index.m3u8", hlsProtected(http.HandlerFunc(h.HLSIndex)))
 	mux.Handle("GET /api/cameras/{id}/hls/r", hlsProtected(http.HandlerFunc(h.HLSResource)))
 
-	return logging(log)(mux)
+	return logging(log)(limitBody(mux))
+}
+
+// maxRequestBody bounds every request body. The largest legitimate one is a
+// WebRTC SDP offer of a few kilobytes.
+const maxRequestBody = 256 << 10
+
+func limitBody(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRequestBody)
+		next.ServeHTTP(w, r)
+	})
 }
 
 func logging(log *slog.Logger) func(http.Handler) http.Handler {

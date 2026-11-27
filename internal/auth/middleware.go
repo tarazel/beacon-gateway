@@ -21,15 +21,15 @@ func UserID(ctx context.Context) (string, bool) {
 
 // Middleware authorizes general API endpoints. It rejects media/HLS-scoped
 // tokens — those are only valid on their own endpoints.
-func Middleware(issuer *JWTIssuer) func(http.Handler) http.Handler {
-	return authMiddleware(issuer, authOpts{})
+func Middleware(issuer *JWTIssuer, users *Store) func(http.Handler) http.Handler {
+	return authMiddleware(issuer, users, authOpts{})
 }
 
 // MediaMiddleware authorizes media endpoints (snapshots/clips) with either a
 // normal access token or a media-scoped token. The latter lets the notification
 // service extension fetch snapshots without being able to refresh.
-func MediaMiddleware(issuer *JWTIssuer) func(http.Handler) http.Handler {
-	return authMiddleware(issuer, authOpts{allowMedia: true})
+func MediaMiddleware(issuer *JWTIssuer, users *Store) func(http.Handler) http.Handler {
+	return authMiddleware(issuer, users, authOpts{allowMedia: true})
 }
 
 // HLSMiddleware authorizes the HLS live-view endpoints. It accepts an access or
@@ -37,8 +37,8 @@ func MediaMiddleware(issuer *JWTIssuer) func(http.Handler) http.Handler {
 // clips only), and (uniquely) also reads the token from a `token` query param —
 // AVPlayer can't set an Authorization header on HLS playlist/segment requests, so
 // the token rides in the URL the live descriptor hands back.
-func HLSMiddleware(issuer *JWTIssuer) func(http.Handler) http.Handler {
-	return authMiddleware(issuer, authOpts{allowHLS: true, allowQuery: true})
+func HLSMiddleware(issuer *JWTIssuer, users *Store) func(http.Handler) http.Handler {
+	return authMiddleware(issuer, users, authOpts{allowHLS: true, allowQuery: true})
 }
 
 type authOpts struct {
@@ -47,7 +47,9 @@ type authOpts struct {
 	allowQuery bool // also accept the token from the `token` query param
 }
 
-func authMiddleware(issuer *JWTIssuer, opts authOpts) func(http.Handler) http.Handler {
+// authMiddleware verifies the token and then that its account still exists and is
+// enabled, so deleting or revoking a user takes effect immediately.
+func authMiddleware(issuer *JWTIssuer, users *Store, opts authOpts) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			raw := ""
@@ -79,6 +81,15 @@ func authMiddleware(issuer *JWTIssuer, opts authOpts) func(http.Handler) http.Ha
 				}
 			default:
 				http.Error(w, "token not valid for this endpoint", http.StatusForbidden)
+				return
+			}
+			active, err := users.IsUserActive(r.Context(), claims.UserID)
+			if err != nil {
+				http.Error(w, "account lookup failed", http.StatusInternalServerError)
+				return
+			}
+			if !active {
+				http.Error(w, "account is not active", http.StatusUnauthorized)
 				return
 			}
 			next.ServeHTTP(w, r.WithContext(WithUser(r.Context(), claims.UserID)))

@@ -28,6 +28,8 @@ var googleIssuers = map[string]bool{
 }
 
 type GoogleIdentity struct {
+	// Nonce is the token's nonce claim (see NoncePolicy).
+	Nonce         string
 	Sub           string
 	Email         string
 	EmailVerified bool
@@ -121,6 +123,7 @@ func (v *GoogleVerifier) Verify(ctx context.Context, idToken string) (*GoogleIde
 		return nil, errors.New("missing sub claim")
 	}
 	id := &GoogleIdentity{Sub: sub}
+	id.Nonce, _ = claims["nonce"].(string)
 	if e, ok := claims["email"].(string); ok {
 		id.Email = e
 	}

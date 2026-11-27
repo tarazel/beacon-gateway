@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tarazel/beacon-gateway/internal/auth"
 	"github.com/tarazel/beacon-gateway/internal/cameras"
 )
 
@@ -97,6 +98,12 @@ type Auth struct {
 	// GOOGLE_ALLOWED_AUDIENCES.
 	GoogleAllowedAudiences []string
 	AppleAllowedEmails     []string
+	// ExtraOrigins are further URLs (besides PublicBaseURL) apps use to reach this
+	// gateway, e.g. a LAN address. Sign-in tokens must be bound to one of them.
+	ExtraOrigins []string
+	// RequireSignInNonce rejects sign-ins from app builds that don't bind their
+	// token to this gateway (see auth.NoncePolicy).
+	RequireSignInNonce bool
 	// AdminEmails are promoted to the 'admin' role on sign-in. Independent of the
 	// first-user bootstrap (which makes whoever signs in first the owner/admin).
 	AdminEmails []string
@@ -188,6 +195,8 @@ func Load() (*Config, error) {
 			GoogleAllowedAudiences: splitCSV(os.Getenv("GOOGLE_ALLOWED_AUDIENCES")),
 			AppleAllowedEmails:     splitCSV(os.Getenv("APPLE_ALLOWED_EMAILS")),
 			AdminEmails:            splitCSV(os.Getenv("ADMIN_EMAILS")),
+			ExtraOrigins:           splitCSV(os.Getenv("AUTH_ALLOWED_ORIGINS")),
+			RequireSignInNonce:     getBool("REQUIRE_SIGNIN_NONCE", true),
 		},
 		APNs: APNs{
 			KeyPath:    os.Getenv("APNS_KEY_PATH"),
@@ -226,10 +235,18 @@ func loadCameras(raw string) ([]cameras.Camera, error) {
 }
 
 func (c *Config) validate() error {
+	for _, raw := range c.Auth.ExtraOrigins {
+		if _, err := auth.CanonicalOrigin(raw); err != nil {
+			return fmt.Errorf("config: AUTH_ALLOWED_ORIGINS: %w", err)
+		}
+	}
 	if c.DevMode {
 		return nil
 	}
 	var problems []string
+	if _, err := auth.CanonicalOrigin(c.PublicBaseURL); err != nil {
+		problems = append(problems, "PUBLIC_BASE_URL must be the http(s) URL apps use to reach this gateway")
+	}
 	if len(c.Auth.JWTSigningKey) < 32 {
 		problems = append(problems, "JWT_SIGNING_KEY must be at least 32 bytes (set DEV_MODE=true to bypass)")
 	}

@@ -118,14 +118,13 @@ func TestSignInGoogleUnverifiedEmailDoesNotLink(t *testing.T) {
 		provider: auth.ProviderApple, sub: "apple-v", email: "v@example.com", emailVerified: true,
 	}))
 
-	// A Google sign-in claiming the same email but UNVERIFIED must not link; since
-	// it's still allowlisted it creates a separate account (safer than trusting an
-	// unverified email to merge into someone else's account).
-	googleUID := decodeUserID(t, callSignIn(t, h, providerSignIn{
+	// A Google sign-in claiming the same email but UNVERIFIED must neither link to
+	// that account nor be admitted by the allowlist.
+	w := callSignIn(t, h, providerSignIn{
 		provider: auth.ProviderGoogle, sub: "goog-v", email: "v@example.com", emailVerified: false,
-	}))
-	if googleUID == appleUID {
-		t.Fatalf("unverified email must not merge accounts; both are %s", appleUID)
+	})
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("unverified email must not be admitted, got %d (apple user %s)", w.Code, appleUID)
 	}
 }
 

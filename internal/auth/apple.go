@@ -24,6 +24,8 @@ const (
 )
 
 type AppleIdentity struct {
+	// Nonce is the token's nonce claim (see NoncePolicy).
+	Nonce         string
 	Sub           string
 	Email         string
 	EmailVerified bool
@@ -103,6 +105,7 @@ func (v *AppleVerifier) Verify(ctx context.Context, identityToken string) (*Appl
 		return nil, errors.New("missing sub claim")
 	}
 	id := &AppleIdentity{Sub: sub}
+	id.Nonce, _ = claims["nonce"].(string)
 	if e, ok := claims["email"].(string); ok {
 		id.Email = e
 	}
